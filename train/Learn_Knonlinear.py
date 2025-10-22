@@ -85,7 +85,7 @@ def Klinear_loss(data,net,mse_loss,u_dim=1,gamma=0.99,Nstate=4,all_loss=0):
     loss = loss/beta_sum
     return loss
 
-def train(env_name,train_steps = 200000,suffix="",augsuffix="",\
+def train(env_name,train_steps = 15000,suffix="",augsuffix="",\
             layer_depth=3,obs_mode="theta",\
             activation_mode="ReLU",Ktrain_samples=50000):
     # Ktrain_samples = 1000
