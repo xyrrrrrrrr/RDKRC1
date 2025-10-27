@@ -13,65 +13,101 @@ import os
 sys.path.append("../utility/")
 from torch.utils.tensorboard import SummaryWriter
 from torchdiffeq import odeint
-from scipy.integrate import odeint
+# from scipy.integrate import odeint
 from Utility import data_collecter
 import time
+import tqdm
 
 # 定义ODE流形拟合网络
 class ODEManifold(nn.Module):
-    def __init__(self, input_dim, hidden_dim=128):
+    def __init__(self, input_dim, hidden_dim=256, n_steps=50):
         super(ODEManifold, self).__init__()
         self.input_dim = input_dim
+        self.n_steps = n_steps
         # ODE向量场参数化网络
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.fc1 = nn.Linear(input_dim + 1, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.fc3 = nn.Linear(hidden_dim, input_dim)
         # 确保向量场在流形上
         self.norm = nn.LayerNorm(input_dim)
         
-    def forward(self, x):
-        """计算向量场 F(x)"""
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
+    def forward(self, x, t):
+        """计算向量场 F(x, t)"""
+        ts = torch.ones([x.shape[0],1], device=x.device) * t
+        x = torch.concatenate([x, ts], axis=1)
+        x = F.silu(self.fc1(x))
+        x = F.silu(self.fc2(x))
         x = self.fc3(x)
         return self.norm(x)  # 归一化确保平滑性
     
     def integrate(self, x0, t):
-        """使用欧拉方法积分ODE"""
-        x = x0.clone()
-        dt = t[1] - t[0] if len(t) > 1 else t[0]
-        
-        for _ in range(len(t)-1):
-            dx = self.forward(x)
-            x = x + dx * dt
-        return x
+        """用RK4阶积分ODE, 保证精度"""
+        # 定义ODE函数：dx/dt = f(x, t)
+        def ode_func(t, x):
+            return self.forward(x, t)
+        x_pred = odeint(ode_func, x0, t, method='rk4')
+        result =  x_pred[-1]  # 返回最后一个时间步的结果
+        return result
     
-    def geodesic_distance(self, x, y, num_steps=100):
-        """
-        正确计算流形上两点间的测地距离（单步积分，维度严格对齐）
-        Args:
-            x: 输入点张量，形状 [batch_size, state_dim] → 例：(50, 2)
-            y: 目标点张量，形状 [batch_size, state_dim] → 例：(50, 2)
-            num_steps: 时间插值步数（控制积分精度）→ 例：100
-        Returns:
-            dist: 测地距离张量，形状 [batch_size] → 例：(50,)，每个元素对应x[i]到y[i]的距离
-        """
-        # 1. 维度一致性预检（提前规避不匹配问题）
-        if x.shape != y.shape:
-            raise ValueError(f"输入点维度不匹配！x.shape={x.shape}, y.shape={y.shape}")
-        if x.dim() != 2:
-            raise ValueError(f"输入点必须是2维张量（[批次数, 状态维]），当前x.dim()={x.dim()}")
-        device = x.device
-        batch_size, state_dim = x.shape  
-        dt = 1.0 / (num_steps - 1)      
-        t = torch.linspace(0, 1, num_steps, device=device)
-        path = x.unsqueeze(0) + t.unsqueeze(1).unsqueeze(2) * (y - x).unsqueeze(0)
-        velocities = self.forward(path.reshape(-1, state_dim)).reshape(num_steps, batch_size, state_dim)
-        step_distances = torch.norm(velocities, dim=2)
+    def compute_pushforward(self, x):
+        """批量计算微分同胚φ(x)的雅可比，避免循环，利用GPU并行"""
+        x = x.requires_grad_(True)  # 批量开启梯度，无需逐个处理
+        t_ode = torch.tensor([0.0, 1.0], device=x.device)
         
-        dist = torch.trapz(step_distances, t, dim=0)
+        # 批量计算雅可比：torch.autograd.functional.jacobian支持批量输入
+        # 输入x: [B, D]，输出雅可比: [B, D, D]（B=batch_size, D=input_dim）
+        J = torch.autograd.functional.jacobian(
+            func=lambda z: self.integrate(z, t_ode),
+            inputs=x,
+            create_graph=False,  # 无需二阶导数，关闭节省计算
+            vectorize=True  # 开启向量化计算，进一步加速
+        )
+        # 调整形状：jacobian输出为[B, D, B, D] → 简化为[B, D, D]（批量样本独立）
+        J = J.diagonal(dim1=0, dim2=2).permute(0, 2, 1)
+        return J
+
+    def geodesic_distance(self, x, y):
+        t = torch.linspace(0, 1, self.n_steps, device=x.device)
+        path = x.unsqueeze(0) + t.unsqueeze(1).unsqueeze(2) * (y - x).unsqueeze(0)  # [S, B, D]
+        batch_size = path.shape[1]
+        sample_step = 5  # 每隔5个step采样一次雅可比（可根据精度调整，建议3-10）
         
-        return dist  # 直接返回积分结果，无需二次处理
+        # 1. 稀疏采样路径点，计算雅可比
+        sample_indices = torch.arange(0, self.n_steps, sample_step, device=x.device)
+        sampled_path = path[sample_indices]  # [S_sample, B, D]，S_sample = S//sample_step
+        J_sampled = self.compute_pushforward(sampled_path.reshape(-1, self.input_dim))  # [S_sample*B, D, D]
+        J_sampled = J_sampled.reshape(len(sample_indices), batch_size, self.input_dim, self.input_dim)  # [S_sample, B, D, D]
+        
+        # 2. 线性插值补全所有step的雅可比（保持精度的同时减少计算）
+        J = torch.nn.functional.interpolate(
+            J_sampled.permute(1, 2, 3, 0),  # [B, D, D, S_sample] → 适配插值维度
+            size=self.n_steps,
+            mode='linear',
+            align_corners=True
+        ).permute(3, 0, 1, 2)  # 恢复为[S, B, D, D]
+        
+        # 3. 计算真实速度（优化点2.1）
+        velocity = torch.gradient(path, dim=0, spacing=t)[0]  # [S-1, B, D]
+        # 裁剪雅可比到S-1个step（与速度维度匹配）
+        J = J[:-1]  # [S-1, B, D, D]
+        
+        # 4. 拉回内积计算（保持文档定义不变）
+        velocity = velocity.unsqueeze(-1)  # [S-1, B, D, 1]
+        J_T = J.transpose(-2, -1)
+        inner_prod = torch.matmul(torch.matmul(torch.matmul(velocity.transpose(-2, -1), J_T), J), velocity)
+        step_distances = torch.sqrt(inner_prod.squeeze(-1).squeeze(-1))
+        
+        # 5. 积分求距离
+        dist = torch.trapz(step_distances, t[:-1], dim=0)
+        return dist
+    
+    def reverse_integrate(self, x1, t):
+        """反向积分：从x1积分回t=0的点"""
+        def ode_func_rev(t, x):
+            return -self.forward(x, t)  # 反向时间：dx/dt = -f(x)
+        x_rec = odeint(ode_func_rev, x1, t.flip(0))  # 时间反转
+        result = x_rec[-1].detach()
+        return result
 
 # 定义网络初始化函数
 def gaussian_init_(n_units, std=1):    
@@ -145,7 +181,7 @@ def K_loss(data, net, u_dim=1, Nstate=4):
     return np.array(max_loss_list), np.array(mean_loss_list)
 
 # 带流形约束的损失函数
-def Klinear_loss_with_manifold(data, net, state_manifold, control_manifold, mse_loss, u_dim=1, gamma=0.99, 
+def Klinear_loss_with_manifold(data, net, ode_manifold, mse_loss, u_dim=1, gamma=0.99, 
                                Nstate=4, all_loss=0, detach=0, lambda_geom=0.1, lambda_lin=0.1, lambda_recon=0.1):
     steps, train_traj_num, NKoopman = data.shape
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -160,32 +196,32 @@ def Klinear_loss_with_manifold(data, net, state_manifold, control_manifold, mse_
     geom_loss = torch.tensor(0.0, dtype=torch.float64, device=device)
     if lambda_geom > 0 and batch_size > 1:
         # 随机选择一些点对计算距离约束
-        idx1 = torch.randint(0, batch_size, (min(100, batch_size//2),), device=device)
-        idx2 = torch.randint(0, batch_size, (min(100, batch_size//2),), device=device)
-
-        x_samples = states[0, idx1, :]
-        y_samples = states[0, idx2, :]
-        u1_samples = controls[0, idx1, :]
-        u2_samples = controls[0, idx2, :]
+        id_traj = torch.randint(0, train_traj_num, (min(100, batch_size//2),), device=device)
+        idx_time = torch.randint(0, steps - 1,  (1,), device=device)
+        idy_time = idx_time + 1
+        x_samples = data[idx_time, id_traj, :]
+        y_samples = data[idy_time, id_traj, :]
+        statex_samples = states[idx_time, id_traj, :]
+        statey_samples = states[idy_time, id_traj, :]
+        ux_samples = controls[idx_time, id_traj, :]
+        uy_samples = controls[idy_time, id_traj, :]
 
         # 计算流形上的测地距离
-        state_geo_dist = state_manifold.geodesic_distance(x_samples, y_samples)
-        control_geo_dist = control_manifold.geodesic_distance(u1_samples, u2_samples)
+        geo_dist = ode_manifold.geodesic_distance(x_samples, y_samples)
 
         # 计算编码空间中的距离
-        encoded_x = net.encode(x_samples)
-        encoded_y = net.encode(y_samples)
-        state_encoded_dist = torch.norm(encoded_x - encoded_y, dim=1)
-        
-        encoded_u1 = net.control_encode(x_samples, u1_samples)
-        encoded_u2 = net.control_encode(y_samples, u2_samples)
-        control_encoded_dist = torch.norm(encoded_u1 - encoded_u2, dim=1)
+        encoded_statex = net.encode(statex_samples)
+        encoded_statey = net.encode(statey_samples)
+        encoded_ux = net.control_encode(statex_samples, ux_samples)
+        encoded_uy = net.control_encode(statey_samples, uy_samples)
+        encoded_x = torch.concatenate([encoded_statex, encoded_ux], dim=1)
+        encoded_y = torch.concatenate([encoded_statey, encoded_uy], dim=1)
+        encoded_dist = torch.norm(encoded_x - encoded_y, dim=1)
 
         # 计算比例因子c，使编码距离与测地距离成比例
-        state_c = torch.sum(state_encoded_dist * state_geo_dist) / (torch.sum(state_geo_dist ** 2) + 1e-8) 
-        control_c = torch.sum(control_encoded_dist * control_geo_dist) / (torch.sum(control_geo_dist ** 2) + 1e-8) 
+        c = torch.sum(encoded_dist * geo_dist) / (torch.sum(geo_dist ** 2) + 1e-8) 
         # 几何约束损失
-        geom_loss = torch.mean(torch.abs(state_encoded_dist - state_c * state_geo_dist)) + torch.mean(torch.abs(control_encoded_dist - control_c * control_geo_dist))
+        geom_loss = torch.mean(torch.abs(encoded_dist - c * geo_dist))
     
     # 原始Koopman损失计算
     X_current = net.encode(data[0,:,u_dim:])
@@ -235,132 +271,56 @@ def Eig_loss(net):
     return loss
 
 # 训练ODE流形模型
-def train_state_manifold(data, input_dim, epochs=10000, lr=1e-3):
+def train_ode_manifold(data, input_dim, epochs=1000, lr=1e-2):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ode_model = ODEManifold(input_dim).to(device).double()
     optimizer = torch.optim.Adam(ode_model.parameters(), lr=lr)
     mse_loss = nn.MSELoss()
-    
     # 准备训练数据：确保数据张量在正确设备且为double类型
     steps, traj_num, dim = data.shape
     u_dim = dim - input_dim  # 数据格式：[时间步, 轨迹数, 控制维+状态维]
     # 转换为double并移动到设备，避免类型不匹配
-    states = torch.DoubleTensor(data[:, :, u_dim:]).to(device)  
-    
-    # 时间点（均匀采样，与数据时间步对应）
-    t = torch.linspace(0, 1, steps, device=device)
-    
-    print(f"开始训练状态ODE流形模型，输入维度: {input_dim}，设备: {device}")
-    
-    for epoch in range(epochs):
+    states = torch.DoubleTensor(data[:, :, :]) 
+    t_ode = torch.tensor([0.0, 1.0]).to(device)
+    pbar = tqdm.trange(epochs)
+    for epoch in pbar:
         total_loss = 0.0
-        
+        ode_loss = 0.0
+        recon_loss = 0.0
         # 随机采样批次（避免显存溢出，限制批次大小）
         idx = random.sample(range(traj_num), min(256, traj_num))
-        batch_states = states[:, idx, :]
-        
+        batch_states = states[:, idx, :].to(device) 
         optimizer.zero_grad()
-        ode_loss = 0.0
-        
+        # idtime = random.sample(range(steps - 1))
         # 1. ODE拟合损失：预测下一时刻状态
         for i in range(steps - 1):
             x0 = batch_states[i]  # t时刻状态
             # 积分一步（从t[i]到t[i+1]）
-            x_pred = ode_model.integrate(x0, t[i:i+2])  
-            x_true = batch_states[i+1]  # t+1时刻真实状态
-            ode_loss += mse_loss(x_pred, x_true)
+            x_pred = ode_model.integrate(x0, t_ode) 
+            x_true = batch_states[i+1] # t+1时刻真实状态
+            x_rec = ode_model.reverse_integrate(x_true, t_ode)
+            ode_loss += mse_loss(x_pred[:, u_dim:], x_true[:, u_dim:])
+            recon_loss += mse_loss(x0, x_rec)
+            del x0, x_pred, x_true, x_rec
         ode_loss = ode_loss / (steps - 1)  # 平均到每个时间步
-        
-        # 2. 向量场光滑性正则化：修复梯度跟踪问题
-        # 重塑为[样本数, 状态维]，并显式开启梯度
-        x_sample = batch_states.reshape(-1, input_dim).requires_grad_(True)
-        # 计算向量场 F(x)
-        dx = ode_model(x_sample)
-        # 计算F对x的梯度（光滑性衡量：梯度越大越不光滑）
-        grad_dx = torch.autograd.grad(
-            outputs=dx.sum(),  # 对所有样本的向量场求和，便于计算梯度
-            inputs=x_sample,
-            create_graph=False,  # 无需二阶导数，关闭节省计算
-            retain_graph=False
-        )[0]  # grad_dx形状：[样本数, 状态维]
-        # 光滑性损失：梯度的L2范数均值
-        smooth_loss = torch.mean(torch.norm(grad_dx, dim=1))
-        
-        # 总损失：ODE拟合损失 + 光滑性正则化（权重0.1平衡）
-        total_loss = ode_loss + 0.1 * smooth_loss
-        
+        recon_loss = recon_loss / (steps - 1)
+        # 总损失
+        # total_loss = 0.5* ode_loss + 0.5 * recon_loss
+        total_loss = ode_loss    
         # 反向传播与优化
         total_loss.backward()
         optimizer.step()
-        
-        # 每50轮打印日志
-        if (epoch + 1) % 50 == 0:
-            print(f"ODE训练 epoch {epoch+1}/{epochs}, 总损失: {total_loss.item():.6f}, 拟合损失: {ode_loss.item():.6f}, 光滑损失: {smooth_loss.item():.6f}")
-    
+        if (epoch + 1) % 20 == 0:
+            for param_group in optimizer.param_groups:
+                param_group['lr'] *= 0.5
+        pbar.set_description_str(f"ODE训练 epoch {epoch+1}/{epochs}, 总损失: {total_loss.item():.6f}, 拟合损失: {ode_loss.item():.6f}, 重建损失: {recon_loss.item():.6f}")
+        del batch_states, ode_loss, recon_loss, total_loss
+        torch.cuda.empty_cache()  # 释放未引用的显存
+
+
     return ode_model
 
-def train_control_manifold(data, input_dim, epochs=1000, lr=1e-3):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # 准备训练数据：确保数据张量在正确设备且为double类型
-    steps, traj_num, dim = data.shape
-    u_dim = dim - input_dim  # 数据格式：[时间步, 轨迹数, 控制维+状态维]
-    ode_model = ODEManifold(u_dim).to(device).double()
-    optimizer = torch.optim.Adam(ode_model.parameters(), lr=lr)
-    mse_loss = nn.MSELoss()
-    # 转换为double并移动到设备，避免类型不匹配
-    controls = torch.DoubleTensor(data[:, :, :u_dim]).to(device)  
-    
-    # 时间点（均匀采样，与数据时间步对应）
-    t = torch.linspace(0, 1, steps, device=device)
-    
-    print(f"开始训练控制ODE流形模型，输入维度: {u_dim}，设备: {device}")
-    
-    for epoch in range(epochs):
-        total_loss = 0.0
-        
-        # 随机采样批次（避免显存溢出，限制批次大小）
-        idx = random.sample(range(traj_num), min(256, traj_num))
-        batch_states = controls[:, idx, :]
-        
-        optimizer.zero_grad()
-        ode_loss = 0.0
-        
-        # 1. ODE拟合损失：预测下一时刻状态
-        for i in range(steps - 1):
-            x0 = batch_states[i]  # t时刻状态
-            # 积分一步（从t[i]到t[i+1]）
-            x_pred = ode_model.integrate(x0, t[i:i+2])  
-            x_true = batch_states[i+1]  # t+1时刻真实状态
-            ode_loss += mse_loss(x_pred, x_true)
-        ode_loss = ode_loss / (steps - 1)  # 平均到每个时间步
-        
-        # 2. 向量场光滑性正则化：修复梯度跟踪问题
-        # 重塑为[样本数, 状态维]，并显式开启梯度
-        x_sample = batch_states.reshape(-1, u_dim).requires_grad_(True)
-        # 计算向量场 F(x)
-        dx = ode_model(x_sample)
-        # 计算F对x的梯度（光滑性衡量：梯度越大越不光滑）
-        grad_dx = torch.autograd.grad(
-            outputs=dx.sum(),  # 对所有样本的向量场求和，便于计算梯度
-            inputs=x_sample,
-            create_graph=False,  # 无需二阶导数，关闭节省计算
-            retain_graph=False
-        )[0]  # grad_dx形状：[样本数, 状态维]
-        # 光滑性损失：梯度的L2范数均值
-        smooth_loss = torch.mean(torch.norm(grad_dx, dim=1))
-        
-        # 总损失：ODE拟合损失 + 光滑性正则化（权重0.1平衡）
-        total_loss = ode_loss + 0.1 * smooth_loss
-        
-        # 反向传播与优化
-        total_loss.backward()
-        optimizer.step()
-        
-        # 每50轮打印日志
-        if (epoch + 1) % 50 == 0:
-            print(f"ODE训练 epoch {epoch+1}/{epochs}, 总损失: {total_loss.item():.6f}, 拟合损失: {ode_loss.item():.6f}, 光滑损失: {smooth_loss.item():.6f}")
-    
-    return ode_model
+
 
 # 主训练函数
 def train(env_name, train_steps=200000, suffix="", all_loss=0,
@@ -381,9 +341,7 @@ def train(env_name, train_steps=200000, suffix="", all_loss=0,
     
     # 第一步：训练ODE流形模型
     print("开始训练ODE流形模型...")
-    # state_manifold = train_state_manifold(Ktrain_data, in_dim)
-    control_manifold = train_control_manifold(Ktrain_data, in_dim)
-    state_manifold = train_state_manifold(Ktrain_data, in_dim)
+    ode_manifold = train_ode_manifold(Ktrain_data, in_dim + u_dim)
     # 网络参数设置
     layer_width = 128
     control_encode_dim = in_dim + u_dim + b_dim
@@ -418,7 +376,7 @@ def train(env_name, train_steps=200000, suffix="", all_loss=0,
     start_time = time.process_time()
     print("开始训练带流形约束的DKN模型...")
     
-    for i in range(train_steps):
+    for i in tqdm.trange(train_steps):
         # 随机采样批次
         Kindex = list(range(Ktrain_samples))
         random.shuffle(Kindex)
@@ -426,7 +384,7 @@ def train(env_name, train_steps=200000, suffix="", all_loss=0,
         
         # 计算带流形约束的损失
         total_loss, pred_loss, lin_loss, geom_loss, recon_loss = Klinear_loss_with_manifold(
-            X, net, state_manifold, control_manifold, mse_loss, u_dim, gamma, Nstate, all_loss, 
+            X, net, ode_manifold, mse_loss, u_dim, gamma, Nstate, all_loss, 
             detach, lambda_geom, lambda_lin
         )
         
@@ -452,7 +410,7 @@ def train(env_name, train_steps=200000, suffix="", all_loss=0,
         if (i + 1) % eval_step == 0:
             with torch.no_grad():
                 eval_loss, _, _, _, _ = Klinear_loss_with_manifold(
-                    Ktest_data, net, state_manifold, control_manifold, mse_loss, u_dim, gamma, 
+                    Ktest_data, net, ode_manifold, mse_loss, u_dim, gamma, 
                     Nstate, all_loss=0, detach=detach, lambda_geom=0, lambda_lin=0
                 )
                 eval_loss_val = eval_loss.detach().cpu().numpy().item()
@@ -467,8 +425,7 @@ def train(env_name, train_steps=200000, suffix="", all_loss=0,
                         'layer': layers, 
                         'belayer': belayers,
                         'bdlayer': bdlayers,
-                        'state_manifold': state_manifold.state_dict(),
-                        'control_manifold': control_manifold.state_dict()
+                        'ode_manifold': ode_manifold.state_dict(),
                     }
                     torch.save(Saved_dict, logdir + ".pth")
                 
@@ -485,7 +442,7 @@ def main():
     parser.add_argument("--suffix", type=str, default="5_2_ode_constraint")
     parser.add_argument("--all_loss", type=int, default=1)
     parser.add_argument("--e_loss", type=int, default=0)
-    parser.add_argument("--K_train_samples", type=int, default=20000)
+    parser.add_argument("--K_train_samples", type=int, default=200)
     parser.add_argument("--gamma", type=float, default=0.8)
     parser.add_argument("--encode_dim", type=int, default=20)
     parser.add_argument("--b_dim", type=int, default=1)

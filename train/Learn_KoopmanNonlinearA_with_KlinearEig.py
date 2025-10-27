@@ -105,7 +105,7 @@ def Eig_loss(net):
     loss = c[mask].sum()
     return loss
 
-def train(env_name,train_steps = 15000,suffix="",all_loss=0,\
+def train(env_name,train_steps = 200000,suffix="",all_loss=0,\
             encode_dim = 12,b_dim=2,layer_depth=3,e_loss=1,gamma=0.5,\
                 detach = 0,Ktrain_samples=50000):
     # Ktrain_samples = 1000
@@ -199,7 +199,7 @@ def train(env_name,train_steps = 15000,suffix="",all_loss=0,\
     
 
 def main():
-    train(args.env,suffix=args.suffix,all_loss=args.all_loss,\
+    train(args.env, suffix=args.suffix,all_loss=args.all_loss,\
         encode_dim=args.encode_dim,layer_depth=args.layer_depth,\
             e_loss=args.e_loss,gamma=args.gamma,detach=args.detach,\
                 b_dim=args.b_dim,Ktrain_samples=args.K_train_samples)
