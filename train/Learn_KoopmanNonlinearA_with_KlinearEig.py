@@ -112,15 +112,16 @@ def train(env_name,train_steps = 200000,suffix="",all_loss=0,\
     # Ktest_samples = 1000
     Ktrain_samples = Ktrain_samples
     Ktest_samples = 20000
-    Ksteps = 30
+    Ktrainsteps = 15
+    Kteststeps = 30
     Kbatch_size = 100
     #data prepare
     data_collect = data_collecter(env_name)
     u_dim = data_collect.udim
-    Ktest_data = data_collect.collect_koopman_data(Ktest_samples,Ksteps,mode="eval")
+    Ktest_data = data_collect.collect_koopman_data(Ktest_samples,Kteststeps,mode="eval")
     Ktest_samples = Ktest_data.shape[1]
     print("test data ok!,shape:",Ktest_data.shape)
-    Ktrain_data = data_collect.collect_koopman_data(Ktrain_samples,Ksteps,mode="train")
+    Ktrain_data = data_collect.collect_koopman_data(Ktrain_samples,Ktrainsteps,mode="train")
     print("train data ok!,shape:",Ktrain_data.shape)
     Ktrain_samples = Ktrain_data.shape[1]
     in_dim = Ktest_data.shape[-1]-u_dim
@@ -189,7 +190,7 @@ def train(env_name,train_steps = 200000,suffix="",all_loss=0,\
                     best_state_dict = copy(net.state_dict())
                     Saved_dict = {'model':best_state_dict,'layer':layers,'blayer':blayers}
                     torch.save(Saved_dict,logdir+".pth")
-                print("Step:{} Eval-loss{} K-loss:{}".format(i,loss,Kloss))
+                print("Method:KoopmanNonlinearA_with_KlinearEigStep:{} Eval-loss{} K-loss:{}".format(i,loss,Kloss))
             # print("-------------END-------------")
         writer.add_scalar('Eval/best_loss',best_loss,i)
         # if (time.process_time()-start_time)>=210*3600:

@@ -257,9 +257,9 @@ def Eig_loss(net):
 def train(env_name,train_steps = 200000,suffix="",all_loss=0,\
             encode_dim = 20,layer_depth=3,e_loss=1,gamma=0.5):
     np.random.seed(98)
-    # Ktrain_samples = 1000
+    Ktrain_samples = 1000
     # Ktest_samples = 1000
-    Ktrain_samples = 50000
+    # # Ktrain_samples = 50000
     Ktest_samples = 20000
     Ksteps = 10
     Kbatch_size = 512
@@ -327,7 +327,7 @@ def train(env_name,train_steps = 200000,suffix="",all_loss=0,\
         # print("Step:{} Loss:{}".format(i,loss.detach().cpu().numpy()))
         if (i+1) % eval_step ==0:
             #K loss
-            total_loss, K_loss, control_loss, geom_loss, recon_loss = Klinear_loss_with_manifold(Ktest_data,net, mse_loss, emb_loss, u_dim,gamma,Nstate,all_loss,lambda_control=0,lambda_geom=0,lambda_recon=0)
+            total_loss, Kloss, control_loss, geom_loss, recon_loss = Klinear_loss_with_manifold(Ktest_data,net, mse_loss, emb_loss, u_dim,gamma,Nstate,all_loss,lambda_control=0,lambda_geom=0,lambda_recon=0)
             Eloss = Eig_loss(net)
             loss = Kloss+Eloss if e_loss else Kloss
             Kloss = Kloss.detach().cpu().numpy()
@@ -341,7 +341,7 @@ def train(env_name,train_steps = 200000,suffix="",all_loss=0,\
                 best_state_dict = copy(net.state_dict())
                 Saved_dict = {'model':best_state_dict,'state_encode_layers': state_encode_layers, 'control_encode_layers': control_encode_layers}
                 torch.save(Saved_dict,"Data/"+subsuffix+".pth")
-            print("Step:{} Eval-loss{} K-loss:{} E-loss:{}".format(i,loss,Kloss,Eloss))
+            print("Step:{} Eval-loss:{} K-loss:{} E-loss:{}".format(i,loss,Kloss,Eloss))
             # print("-------------END-------------")
     print("END-best_loss{}".format(best_loss))
     

@@ -333,7 +333,7 @@ def train(env_name, train_steps=200000, suffix="", all_loss=0,
                     }
                     torch.save(Saved_dict, logdir + ".pth")
                 
-                print(f"步骤: {i}, 评估损失: {eval_loss_val:.6f}, 最佳损失: {best_loss:.6f}")
+                print(f"Method:DKNgxu 步骤: {i}, 评估损失: {eval_loss_val:.6f}, 最佳损失: {best_loss:.6f}")
         
         writer.add_scalar('Eval/best_loss', best_loss, i)
     

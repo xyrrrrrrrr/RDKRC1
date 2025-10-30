@@ -97,7 +97,8 @@ def train(env_name,train_steps = 200000,suffix="",augsuffix="",\
     # Ktest_samples = 1000    
     Ktrain_samples = Ktrain_samples
     Ktest_samples = 20000
-    Ksteps = 30
+    Ktrainsteps = 15
+    Kteststeps = 30
     Kbatch_size = 100
     res = 1
     normal = 1
@@ -105,9 +106,9 @@ def train(env_name,train_steps = 200000,suffix="",augsuffix="",\
     #data prepare
     data_collect = data_collecter(env_name)
     u_dim = data_collect.udim
-    Ktest_data = data_collect.collect_koopman_data(Ktest_samples,Ksteps)
+    Ktest_data = data_collect.collect_koopman_data(Ktest_samples,Kteststeps)
     print("test data ok!")
-    Ktrain_data = data_collect.collect_koopman_data(Ktrain_samples,Ksteps)
+    Ktrain_data = data_collect.collect_koopman_data(Ktrain_samples,Ktrainsteps)
     print("train data ok!")
     in_dim = Ktest_data.shape[-1]-u_dim
     Nstate = in_dim
@@ -165,7 +166,7 @@ def train(env_name,train_steps = 200000,suffix="",augsuffix="",\
                     Saved_dict = {'model':best_state_dict,'Elayer':Elayers}
                     torch.save(Saved_dict,logdir+".pth")
                     # print(logdir+".pth")
-                print("Step:{} Eval K-loss:{} ".format(i,Kloss.detach().cpu().numpy()))
+                print("Method:KNonlinearRNN Step:{} Eval K-loss:{} ".format(i,Kloss.detach().cpu().numpy()))
             # print("-------------END-------------")
         writer.add_scalar('Eval/best_loss',best_loss,i)
         # if (time.process_time()-start_time)>=210*3600:

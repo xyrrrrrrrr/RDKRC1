@@ -8,6 +8,7 @@ from rbf import rbf
 from gym import spaces
 import sys
 sys.path.append("../franka")
+sys.path.append("../gym_env")
 #data collect
 
 class RBFLiftFunc():
@@ -165,7 +166,7 @@ class DoublePendulum():
         G = np.zeros((2,1))
         G[0,0] = (m1+m2)*l1*g*np.cos(th1)+m2*g*l2*np.cos(th1+th2)
         G[1,0] = m2*g*l2*np.cos(th1+th2)
-        Minv = scipy.linalg.pinv2(M)
+        Minv = scipy.linalg.pinv(M)
         ddth = np.dot(Minv,(u-C-G)).reshape(-1)
         f[0] = dth1
         f[1] = dth2
@@ -247,7 +248,7 @@ class data_collecter():
             self.umin = self.env.umin
             self.udim = 2            
         elif self.env_name.endswith("Franka"):
-            from franka_env import FrankaEnv
+            from franka.franka_env import FrankaEnv
             self.env =  FrankaEnv(render = False)
             self.Nstates = 17
             self.uval = 0.12
@@ -260,10 +261,34 @@ class data_collecter():
             self.uval = 20
             self.udim = 7
             self.reset_joint_state = np.array(self.env.reset_joint_state)
+        elif self.env_name.startswith("Pendulum-v1"):
+            from gym_env.pendulum import PendulumEnv
+            self.env = PendulumEnv()
+            self.env.seed(2022)
+            self.udim = self.env.action_space.shape[0]
+            self.Nstates = self.env.observation_space.shape[0]
+            self.umin = self.env.action_space.low
+            self.umax = self.env.action_space.high
+        elif self.env_name.startswith("CartPole-v1"):
+            from gym_env.cartpole import CartPoleEnv
+            self.env = CartPoleEnv()
+            self.env.seed(2022)
+            self.udim = self.env.action_space.shape[0]
+            self.Nstates = self.env.observation_space.shape[0]
+            self.umin = self.env.action_space.low
+            self.umax = self.env.action_space.high
+        elif self.env_name.startswith("MountainCarContinuous-v0"):
+            from gym_env.continuous_mountain_car import Continuous_MountainCarEnv
+            self.env = Continuous_MountainCarEnv()
+            self.env.seed(2022)
+            self.udim = self.env.action_space.shape[0]
+            self.Nstates = self.env.observation_space.shape[0]
+            self.umin = self.env.action_space.low
+            self.umax = self.env.action_space.high
         else:
             self.env = gym.make(env_name)
             self.env.seed(2022)
-            self.udim = self.env.action_space.shape[0]
+            self.udim = self.env.action_space.shape[0] if len(self.env.action_space.shape) >=1 else 1
             self.Nstates = self.env.observation_space.shape[0]
             self.umin = self.env.action_space.low
             self.umax = self.env.action_space.high

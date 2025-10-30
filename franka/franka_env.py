@@ -1,7 +1,7 @@
 import pybullet as pb
 import pybullet_data
 import numpy as np
-
+from gym import spaces
 class FrankaEnv(object):
 
     def __init__(self, render=True, ts=0.002):
@@ -22,6 +22,32 @@ class FrankaEnv(object):
         self.reset()
         self.joint_low = np.array([-2.9,-1.8,-2.9,-3.0,-2.9,-0.08,-2.9])
         self.joint_high = np.array([2.9,1.8,2.9,0.08,2.9,3.0,2.9])
+        # 状态空间定义（总维度17，需与self.Nstates一致）
+        self.ee_pos_low = [-1.0, -1.0, 0.0]  # 末端位置下界（示例：工作空间范围）
+        self.ee_pos_high = [1.0, 1.0, 1.0]   # 末端位置上界（根据机械臂工作空间调整）
+        self.joint_vel_low = np.array([-2.175] * 7)  # 关节速度下限（单位：rad/s，参考Franka参数）
+        self.joint_vel_high = np.array([2.175] * 7)  # 关节速度上限
+        
+        # 拼接状态空间上下界（总长度7+7+3=17）
+        self.state_low = np.concatenate([
+            self.ee_pos_low,       # 末端位置
+            self.joint_low,       # 关节位置
+            self.joint_vel_low
+
+        ], dtype=np.float32)
+        self.state_high = np.concatenate([
+            self.ee_pos_high,      # 末端位置
+            self.joint_high,     # 关节位置
+            self.joint_vel_high
+        ], dtype=np.float32)
+        
+        # 定义观测空间和动作空间
+        self.observation_space = spaces.Box(
+            low=self.state_low,
+            high=self.state_high,
+            dtype=np.float32
+        )
+        self.action_space = spaces.Box(low=-self.sat_val, high=self.sat_val, shape=(7,), dtype=np.float32)
         self.Nstates = 17
         self.udim = 7
         self.dt = self.frame_skip*ts
