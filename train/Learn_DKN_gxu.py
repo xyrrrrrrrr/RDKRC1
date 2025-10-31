@@ -296,7 +296,7 @@ def train(env_name, train_steps=200000, suffix="", all_loss=0,
             X, net, mse_loss, emb_loss, u_dim, gamma, Nstate, all_loss, 
             detach, lambda_geom, lambda_control, lambda_recon
         )
-        pbar.set_postfix({"Total Loss": f"{total_loss:.6f}", "K-step Loss": f"{pred_loss:.6f}", "Control loss": f"{control_loss:.6f}", "Geometry Loss": f"{geom_loss:.6f}", "Reconstruct Loss": f"{recon_loss:.6f}"})
+        pbar.set_postfix({"Total Loss": f"{total_loss}", "K-step Loss": f"{pred_loss}", "Control loss": f"{control_loss}", "Geometry Loss": f"{geom_loss}", "Reconstruct Loss": f"{recon_loss}"})
         # 反向传播和优化
         optimizer.zero_grad()
         total_loss.backward()
@@ -333,7 +333,7 @@ def train(env_name, train_steps=200000, suffix="", all_loss=0,
                     }
                     torch.save(Saved_dict, logdir + ".pth")
                 
-                print(f"Method:DKNgxu 步骤: {i}, 评估损失: {eval_loss_val:.6f}, 最佳损失: {best_loss:.6f}")
+                print(f"Method:DKNgxu 步骤: {i}, 评估损失: {eval_loss_val}, 最佳损失: {best_loss}")
         
         writer.add_scalar('Eval/best_loss', best_loss, i)
     
