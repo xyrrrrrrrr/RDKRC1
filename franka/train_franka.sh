@@ -1,0 +1,2 @@
+python Learn_DKN_gxu_Franka.py
+python Learn_Knonlinear_Franka.py

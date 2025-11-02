@@ -1,24 +1,59 @@
+from ntpath import join
 import torch
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
-import gym
 import matplotlib.pyplot as plt
 import random
 from collections import OrderedDict
 from copy import copy
 import argparse
-import sys
 import os
-sys.path.append("../utility/")
-sys.path.append("../")
 from torch.utils.tensorboard import SummaryWriter
 from scipy.integrate import odeint
-from Utility import data_collecter
-import time
+# physics engine
+import pybullet as pb
+import pybullet_data
+from scipy.io import loadmat, savemat
+# Franka simulator
+from franka_env import FrankaEnv
+
+#data collect
+def Obs(o):
+    return np.concatenate((o[:3],o[7:]),axis=0)
+
+class data_collecter():
+    def __init__(self,env_name) -> None:
+        self.env_name = env_name
+        self.env =  FrankaEnv(render = False)
+        self.Nstates = 17
+        self.uval = 0.12
+        self.udim = 7
+        self.reset_joint_state = np.array(self.env.reset_joint_state)
+
+    def collect_koopman_data(self,traj_num,steps):
+        train_data = np.empty((steps+1,traj_num,self.Nstates+self.udim))
+        for traj_i in range(traj_num):
+            noise = (np.random.rand(7)-0.5)*2*0.2
+            joint_init = self.reset_joint_state+noise
+            joint_init = np.clip(joint_init,self.env.joint_low,self.env.joint_high)
+            s0 = self.env.reset_state(joint_init)
+            s0 = Obs(s0)
+            u10 = (np.random.rand(7)-0.5)*2*self.uval
+            train_data[0,traj_i,:]=np.concatenate([u10.reshape(-1),s0.reshape(-1)],axis=0).reshape(-1)
+            for i in range(1,steps+1):
+                s0 = self.env.step(u10)
+                s0 = Obs(s0)
+                u10 = (np.random.rand(7)-0.5)*2*self.uval
+                train_data[i,traj_i,:]=np.concatenate([u10.reshape(-1),s0.reshape(-1)],axis=0).reshape(-1)
+        return train_data
         
 #define network
-
+def gaussian_init_(n_units, std=1):    
+    sampler = torch.distributions.Normal(torch.Tensor([0]), torch.Tensor([std/n_units]))
+    Omega = sampler.sample((n_units, n_units))[..., 0]  
+    return Omega
+    
 class Network(nn.Module):
     def __init__(self,layers,u_dim,activation_mode="ReLU", device="cuda"):
         super(Network,self).__init__()
@@ -86,12 +121,12 @@ def Klinear_loss(data,net,mse_loss,u_dim=1,gamma=0.99,Nstate=4,all_loss=0):
     loss = loss/beta_sum
     return loss
 
-def train(env_name,train_steps = 200000,suffix="",augsuffix="",\
-            layer_depth=3,obs_mode="theta",\
-            activation_mode="ReLU",Ktrain_samples=50000):
-    # Ktrain_samples = 1000
-    # Ktest_samples = 1000
-    Ktrain_samples = Ktrain_samples
+def train(env_name,train_steps = 300000,suffix="",all_loss=0,\
+            encode_dim = 20,layer_depth=3,e_loss=1,gamma=0.5):
+    np.random.seed(98)
+    # Ktrain_samples = 100
+    # Ktest_samples = 100
+    Ktrain_samples = 50000
     Ktest_samples = 20000
     Ktrainsteps = 15
     Kteststeps = 30
@@ -102,10 +137,10 @@ def train(env_name,train_steps = 200000,suffix="",augsuffix="",\
     #data prepare
     data_collect = data_collecter(env_name)
     u_dim = data_collect.udim
-    Ktest_data = data_collect.collect_koopman_data(Ktest_samples,Kteststeps,mode="eval")
+    Ktest_data = data_collect.collect_koopman_data(Ktest_samples,Kteststeps)
     Ktest_samples = Ktest_data.shape[1]
     print("test data ok!,shape:",Ktest_data.shape)
-    Ktrain_data = data_collect.collect_koopman_data(Ktrain_samples,Ktrainsteps,mode="train")
+    Ktrain_data = data_collect.collect_koopman_data(Ktrain_samples,Ktrainsteps)
     print("train data ok!,shape:",Ktrain_data.shape)
     Ktrain_samples = Ktrain_data.shape[1]
     in_dim = Ktest_data.shape[-1]-u_dim
@@ -115,7 +150,7 @@ def train(env_name,train_steps = 200000,suffix="",augsuffix="",\
     Elayers = [in_dim+u_dim]+[layer_width]*layer_depth+[in_dim]
     # Blayers = [in_dim]+[layer_width]*layer_depth+[in_dim*u_dim]
     print("layers:",Elayers)
-    net = Network(Elayers,u_dim,activation_mode)
+    net = Network(Elayers,u_dim,activation_mode="ReLU")
     # print(net.named_modules())
     eval_step = 1000
     learning_rate = 1e-3
@@ -128,16 +163,16 @@ def train(env_name,train_steps = 200000,suffix="",augsuffix="",\
     for name, param in net.named_parameters():
         print("model:",name,param.requires_grad)
     #train
-    eval_step = 500
+    eval_step = 1000
     best_loss = 1000.0
     best_state_dict = {}
-    logdir = "../Data/"+suffix+"/KNonlinear_"+env_name+augsuffix+"layer{}_AT{}_mode{}_samples{}".format(layer_depth,activation_mode,obs_mode,Ktrain_samples)
-    if not os.path.exists( "../Data/"+suffix):
-        os.makedirs( "../Data/"+suffix)
+    subsuffix = suffix+"KK_KNonlinear"+env_name+"layer{}_edim{}_eloss{}_gamma{}_aloss{}".format(layer_depth,encode_dim,e_loss,gamma,all_loss)
+    logdir = "Data/"+suffix+"/"+subsuffix
+    if not os.path.exists( "Data/"+suffix):
+        os.makedirs( "Data/"+suffix)
     if not os.path.exists(logdir):
         os.makedirs(logdir)
     writer = SummaryWriter(log_dir=logdir)
-    start_time = time.process_time()
     for i in range(train_steps):
         #K loss
         Kindex = list(range(Ktrain_samples))
@@ -167,19 +202,18 @@ def train(env_name,train_steps = 200000,suffix="",augsuffix="",\
     
 
 def main():
-    train(args.env,suffix=args.suffix,\
-            layer_depth=args.layer_depth,obs_mode=args.obs_mode,\
-            activation_mode=args.activation_mode,augsuffix=args.augsuffix,
-            Ktrain_samples=args.K_train_samples)
+    train(args.env,suffix=args.suffix,all_loss=args.all_loss,\
+        encode_dim=args.encode_dim,layer_depth=args.layer_depth,\
+            e_loss=args.eloss,gamma=args.gamma)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--env",type=str,default="DampingPendulum")
-    parser.add_argument("--suffix",type=str,default="4_28")
-    parser.add_argument("--K_train_samples",type=int,default=50000)
-    parser.add_argument("--augsuffix",type=str,default="")
-    parser.add_argument("--obs_mode",type=str,default="theta")
-    parser.add_argument("--activation_mode",type=str,default="ReLU")
+    parser.add_argument("--env",type=str,default="Franka")
+    parser.add_argument("--suffix",type=str,default="")
+    parser.add_argument("--all_loss",type=int,default=1)
+    parser.add_argument("--eloss",type=int,default=0)
+    parser.add_argument("--gamma",type=float,default=0.8)
+    parser.add_argument("--encode_dim",type=int,default=20)
     parser.add_argument("--layer_depth",type=int,default=3)
     args = parser.parse_args()
     main()

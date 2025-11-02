@@ -1,0 +1,2 @@
+python Learn_KoopmanNonlinear_with_KlinearEig_Franka.py
+python Learn_KoopmanNonlinearA_with_KlinearEig_Franka.py

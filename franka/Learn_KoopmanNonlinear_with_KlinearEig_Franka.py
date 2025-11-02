@@ -55,30 +55,58 @@ def gaussian_init_(n_units, std=1):
     return Omega
     
 class Network(nn.Module):
-    def __init__(self,encode_layers,Nkoopman,u_dim):
+    def __init__(self,encode_layers,bilinear_layers,Nkoopman,u_dim, device=None):
         super(Network,self).__init__()
-        Layers = OrderedDict()
+        ELayers = OrderedDict()
         for layer_i in range(len(encode_layers)-1):
-            Layers["linear_{}".format(layer_i)] = nn.Linear(encode_layers[layer_i],encode_layers[layer_i+1])
+            ELayers["linear_{}".format(layer_i)] = nn.Linear(encode_layers[layer_i],encode_layers[layer_i+1])
             if layer_i != len(encode_layers)-2:
-                Layers["relu_{}".format(layer_i)] = nn.ReLU()
-        self.encode_net = nn.Sequential(Layers)
+                ELayers["relu_{}".format(layer_i)] = nn.ReLU()
+        self.encode_net = nn.Sequential(ELayers)
+        BLayers = OrderedDict()
+        for layer_i in range(len(bilinear_layers)-1):
+            BLayers["linear_{}".format(layer_i)] = nn.Linear(bilinear_layers[layer_i],bilinear_layers[layer_i+1])
+            if layer_i != len(bilinear_layers)-2:
+                BLayers["relu_{}".format(layer_i)] = nn.ReLU()
+        self.bilinear_net = nn.Sequential(BLayers)           
         self.Nkoopman = Nkoopman
         self.u_dim = u_dim
         self.lA = nn.Linear(Nkoopman,Nkoopman,bias=False)
         self.lA.weight.data = gaussian_init_(Nkoopman, std=1)
         U, _, V = torch.svd(self.lA.weight.data)
         self.lA.weight.data = torch.mm(U, V.t()) * 0.9
-        self.lB = nn.Linear(u_dim,Nkoopman,bias=False)
+        self.lB = nn.Linear(bilinear_layers[-1],Nkoopman,bias=False)
+        self.device = torch.device(device) if device else torch.device("cuda")
 
     def encode(self,x):
         return torch.cat([x,self.encode_net(x)],axis=-1)
     
-    def forward(self,x,u):
-        return self.lA(x)+self.lB(u)
+    def bicode(self,x,u):
+        x_all = torch.cat([x,u],axis=-1)
+        return self.bilinear_net(x_all)
+    
+
+    def forward(self,x,b):
+        return self.lA(x)+self.lB(b)
+
+def K_loss(data,net,u_dim=1,Nstate=4):
+    steps,train_traj_num,Nstates = data.shape
+    device = net.device
+    data = torch.DoubleTensor(data).to(device)
+    X_current = net.encode(data[0,:,u_dim:])
+    max_loss_list = []
+    mean_loss_list = []
+    for i in range(steps-1):
+        bilinear = net.bicode(X_current[:,:Nstate].detach(),data[i,:,:u_dim]) #detach's problem 
+        X_current = net.forward(X_current,bilinear)
+        Y = data[i+1,:,u_dim:]
+        Err = X_current[:,:Nstate]-Y
+        max_loss_list.append(torch.mean(torch.max(torch.abs(Err),axis=0).values).detach().cpu().numpy())
+        mean_loss_list.append(torch.mean(torch.mean(torch.abs(Err),axis=0)).detach().cpu().numpy())
+    return np.array(max_loss_list),np.array(mean_loss_list)
 
 #loss function
-def Klinear_loss(data,net,mse_loss,u_dim=1,gamma=0.99,Nstate=4,all_loss=0):
+def Klinear_loss(data,net,mse_loss,u_dim=1,gamma=0.99,Nstate=4,all_loss=0,detach=0):
     steps,train_traj_num,NKoopman = data.shape
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     data = torch.DoubleTensor(data).to(device)
@@ -86,24 +114,23 @@ def Klinear_loss(data,net,mse_loss,u_dim=1,gamma=0.99,Nstate=4,all_loss=0):
     beta = 1.0
     beta_sum = 0.0
     loss = torch.zeros(1,dtype=torch.float64).to(device)
+    Augloss = torch.zeros(1,dtype=torch.float64).to(device)
     for i in range(steps-1):
-        X_current = net.forward(X_current,data[i,:,:u_dim])
+        bilinear = net.bicode(X_current[:,:Nstate].detach(),data[i,:,:u_dim]) #detach's problem 
+        X_current = net.forward(X_current,bilinear)
         beta_sum += beta
         if not all_loss:
             loss += beta*mse_loss(X_current[:,:Nstate],data[i+1,:,u_dim:])
         else:
             Y = net.encode(data[i+1,:,u_dim:])
             loss += beta*mse_loss(X_current,Y)
+        X_current_encoded = net.encode(X_current[:,:Nstate])
+        Augloss += mse_loss(X_current_encoded,X_current)
         beta *= gamma
     loss = loss/beta_sum
-    return loss
+    Augloss = Augloss/beta_sum
+    return loss+0.5*Augloss
 
-def Stable_loss(net,Nstate):
-    x_ref = np.zeros(Nstate)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    x_ref_lift = net.encode_only(torch.DoubleTensor(x_ref).to(device))
-    loss = torch.norm(x_ref_lift)
-    return loss
 
 def Eig_loss(net):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -122,23 +149,27 @@ def train(env_name,train_steps = 300000,suffix="",all_loss=0,\
     Ktest_samples = 20000
     Ktrainsteps = 15
     Kteststeps = 30
-    Kbatch_size = 100
     u_dim = 7
+    b_dim = 4
+    Kbatch_size = 100
     #data prepare
     data_collect = data_collecter(env_name)
+    u_dim = data_collect.udim
     Ktest_data = data_collect.collect_koopman_data(Ktest_samples,Kteststeps)
-    print("test data ok!")
+    Ktest_samples = Ktest_data.shape[1]
+    print("test data ok!,shape:",Ktest_data.shape)
     Ktrain_data = data_collect.collect_koopman_data(Ktrain_samples,Ktrainsteps)
-    print("train data ok!")
-    # savemat('FrankaTrainingData.mat',{'Train_data':Ktrain_data,'Test_data':Ktest_data})
-    # raise NotImplementedError
+    print("train data ok!,shape:",Ktrain_data.shape)
+    Ktrain_samples = Ktrain_data.shape[1]
     in_dim = Ktest_data.shape[-1]-u_dim
     Nstate = in_dim
+    # layer_depth = 4
     layer_width = 128
     layers = [in_dim]+[layer_width]*layer_depth+[encode_dim]
+    blayers = [in_dim+u_dim]+[layer_width]*layer_depth+[b_dim]
     Nkoopman = in_dim+encode_dim
     print("layers:",layers)
-    net = Network(layers,Nkoopman,u_dim)
+    net = Network(layers,blayers,Nkoopman,u_dim)
     # print(net.named_modules())
     eval_step = 1000
     learning_rate = 1e-3
@@ -154,7 +185,7 @@ def train(env_name,train_steps = 300000,suffix="",all_loss=0,\
     eval_step = 1000
     best_loss = 1000.0
     best_state_dict = {}
-    subsuffix = suffix+"KK_Koopmanlinear"+env_name+"layer{}_edim{}_eloss{}_gamma{}_aloss{}".format(layer_depth,encode_dim,e_loss,gamma,all_loss)
+    subsuffix = suffix+"KK_KoopmanNonlinear"+env_name+"layer{}_edim{}_eloss{}_gamma{}_aloss{}".format(layer_depth,encode_dim,e_loss,gamma,all_loss)
     logdir = "Data/"+suffix+"/"+subsuffix
     if not os.path.exists( "Data/"+suffix):
         os.makedirs( "Data/"+suffix)
@@ -174,26 +205,34 @@ def train(env_name,train_steps = 300000,suffix="",all_loss=0,\
         optimizer.step() 
         writer.add_scalar('Train/Kloss',Kloss,i)
         writer.add_scalar('Train/Eloss',Eloss,i)
+        # writer.add_scalar('Train/Dloss',Dloss,i)
         writer.add_scalar('Train/loss',loss,i)
         # print("Step:{} Loss:{}".format(i,loss.detach().cpu().numpy()))
         if (i+1) % eval_step ==0:
             #K loss
-            Kloss = Klinear_loss(Ktest_data,net,mse_loss,u_dim,gamma,Nstate,all_loss)
-            Eloss = Eig_loss(net)
-            loss = Kloss+Eloss if e_loss else Kloss
-            Kloss = Kloss.detach().cpu().numpy()
-            Eloss = Eloss.detach().cpu().numpy()
-            loss = loss.detach().cpu().numpy()
-            writer.add_scalar('Eval/Kloss',Kloss,i)
-            writer.add_scalar('Eval/Eloss',Eloss,i)
-            writer.add_scalar('Eval/loss',loss,i)
-            if loss<best_loss:
-                best_loss = copy(Kloss)
-                best_state_dict = copy(net.state_dict())
-                Saved_dict = {'model':best_state_dict,'layer':layers}
-                torch.save(Saved_dict,"Data/"+subsuffix+".pth")
-            print("Step:{} Eval-loss{} K-loss:{} E-loss:{}".format(i,loss,Kloss,Eloss))
-            # print("-------------END-------------")
+            with torch.no_grad():
+                Kloss = Klinear_loss(Ktest_data,net,mse_loss,u_dim,gamma,Nstate,all_loss=0,detach=1)
+                Eloss = Eig_loss(net)
+                loss = Kloss
+                Kloss = Kloss.detach().cpu().numpy()
+                Eloss = Eloss.detach().cpu().numpy()
+                # Dloss = Dloss.detach().cpu().numpy()
+                loss = loss.detach().cpu().numpy()
+                writer.add_scalar('Eval/Kloss',Kloss,i)
+                writer.add_scalar('Eval/Eloss',Eloss,i)
+                writer.add_scalar('Eval/best_loss',best_loss,i)
+                writer.add_scalar('Eval/loss',loss,i)
+                if loss<best_loss:
+                    best_loss = copy(Kloss)
+                    best_state_dict = copy(net.state_dict())
+                    Saved_dict = {'model':best_state_dict,'layer':layers,'blayer':blayers}
+                    torch.save(Saved_dict,logdir+".pth")
+                print("Method:KoopmanNonlinear_with_KlinearEig Step:{} Eval-loss{} K-loss:{}".format(i,loss,Kloss))
+                # print("-------------END-------------")
+        writer.add_scalar('Eval/best_loss',best_loss,i)
+        # if (time.process_time()-start_time)>=210*3600:
+        #     print("time out!:{}".format(time.clock()-start_time))
+        #     break
     print("END-best_loss{}".format(best_loss))
     
 

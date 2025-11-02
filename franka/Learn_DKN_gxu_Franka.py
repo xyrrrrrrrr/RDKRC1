@@ -10,6 +10,7 @@ from copy import copy
 import argparse
 import sys
 import os
+import tqdm
 sys.path.append("../utility/")
 sys.path.append("../franka/")
 from torch.utils.tensorboard import SummaryWriter
@@ -106,7 +107,7 @@ def gaussian_init_(n_units, std=1):
     return Omega
     
 class Network(nn.Module):
-    def __init__(self, state_encode_layers, control_encode_layers, Nkoopman, u_dim, control_output_dim):
+    def __init__(self, state_encode_layers, control_encode_layers, Nkoopman, u_dim, control_output_dim, device=None):
         super(Network, self).__init__()
         Statelayers = OrderedDict()
         for layer_i in range(len(state_encode_layers)-1):
@@ -130,6 +131,9 @@ class Network(nn.Module):
         self.lA.weight.data = torch.mm(U, V.t()) * 0.9
         # self.lB = nn.Linear(belayers[-1], Nkoopman, bias=False)
         self.lB = nn.Linear(control_output_dim, Nkoopman, bias=False)
+        self.device = torch.device(device) if device else torch.device("cuda")
+
+
     # 状态提升
     def encode(self, x):
         return torch.cat([x, self.state_encoder(x)], axis=-1)
@@ -143,7 +147,25 @@ class Network(nn.Module):
     def forward(self, z, hat_u):
         return self.lA(z) + self.lB(hat_u)
 
-#loss function
+# 计算Kloss
+def K_loss(data, net, u_dim=1, Nstate=4):
+    steps, train_traj_num, Nstates = data.shape
+    device = net.device
+    data = torch.DoubleTensor(data).to(device)
+    Z_current = net.encode(data[0,:,u_dim:])
+    max_loss_list = []
+    mean_loss_list = []
+    for i in range(steps-1):
+        hat_u = net.control_encode(Z_current, data[i,:,:u_dim])
+        Z_next = net.forward(Z_current, hat_u)
+        Y = data[i+1,:,u_dim:]
+        Err = Z_next[:,:Nstate] - Y
+        Z_current = Z_next
+        max_loss_list.append(torch.mean(torch.max(torch.abs(Err), axis=0).values).detach().cpu().numpy())
+        mean_loss_list.append(torch.mean(torch.mean(torch.abs(Err), axis=0)).detach().cpu().numpy())
+    return np.array(max_loss_list), np.array(mean_loss_list)
+
+# 带流形约束的损失函数
 def Klinear_loss_with_manifold(data, net, mse_loss, emb_loss, u_dim=1, gamma=0.99, 
                                Nstate=4, all_loss=0, detach=0, lambda_geom=0.1, lambda_control=0.1, lambda_recon=0.3):
     steps, train_traj_num, NKoopman = data.shape
@@ -179,39 +201,52 @@ def Klinear_loss_with_manifold(data, net, mse_loss, emb_loss, u_dim=1, gamma=0.9
     pred_loss = torch.tensor(0.0, dtype=torch.float64, device=device)
     control_loss = torch.tensor(0.0, dtype=torch.float64, device=device)
     recon_loss = torch.tensor(0.0, dtype=torch.float64, device=device)
+    Augloss = torch.tensor(0.0, dtype=torch.float64, device=device)
     # Z_current[:,:Nstate] = X_current
     for i in range(steps-1):
         hat_u = net.control_encode(Z_current if detach else Z_current, 
                              data[i,:,:u_dim])
         Z_next = net.forward(Z_current, hat_u)
         beta_sum += beta
-        Z_next_encoded = net.encode(data[i+1,:,u_dim:])
         # Koopman线性性约束
         if not all_loss:
             pred_loss += beta * mse_loss(Z_next[:,:Nstate], data[i+1,:,u_dim:])
         else:
+            Z_next_encoded = net.encode(data[i+1,:,u_dim:])
             pred_loss += beta * mse_loss(Z_next, Z_next_encoded)
         # 重建误差        
-        x_rec = Z_current[:,:Nstate] 
         u_rec = hat_u[:,:u_dim]
         # recon_loss += (mse_loss(u_rec, data[i,:,:u_dim]) + mse_loss(x_rec, data[i:,:,u_dim:]))
+        Z_aug = net.encode(Z_current[:,:Nstate])
+        Augloss += mse_loss(Z_current, Z_aug)
         recon_loss += mse_loss(u_rec, data[i,:,:u_dim])
         Z_current = Z_next
         beta *= gamma
     
-    pred_loss = pred_loss / beta_sum if beta_sum > 0 else pred_loss
+    # pred_loss = pred_loss / beta_sum if beta_sum > 0 else pred_loss
+    Augloss = Augloss / beta_sum if beta_sum > 0 else pred_loss
 
     if lambda_control > 0:
         control_loss = Eig_loss(net) + Controlability_loss(net)
-        control_loss = control_loss / beta_sum if beta_sum > 0 else control_loss
+        # control_loss = control_loss / beta_sum if beta_sum > 0 else control_loss
 
     if lambda_recon > 0:
         recon_loss = recon_loss / beta_sum if beta_sum > 0 else recon_loss
 
-    total_loss = pred_loss + lambda_geom * geom_loss + lambda_control * control_loss + lambda_recon * recon_loss
+    total_loss = pred_loss+ 0.5*Augloss + lambda_geom * geom_loss + lambda_control * control_loss + lambda_recon * recon_loss
 
     return total_loss, pred_loss, control_loss, geom_loss, recon_loss
 
+# 特征值损失
+def Eig_loss(net):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    A = net.lA.weight
+    c = torch.linalg.eigvals(A).abs() - torch.ones(1, dtype=torch.float64).to(device)
+    mask = c > 0
+    loss = c[mask].sum()
+    return loss
+
+# 能控性损失
 def Controlability_loss(net):
     A = net.lA.weight
     B = net.lB.weight
@@ -239,36 +274,20 @@ def Controlability_loss(net):
     
     return loss.clamp(min=0.0)  # 确保损失非负（奇异值过小时才产生惩罚）
 
-def Stable_loss(net,Nstate):
-    x_ref = np.zeros(Nstate)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    x_ref_lift = net.encode_only(torch.DoubleTensor(x_ref).to(device))
-    loss = torch.norm(x_ref_lift)
-    return loss
-
-def Eig_loss(net):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    A = net.lA.weight
-    c = torch.linalg.eigvals(A).abs()-torch.ones(1,dtype=torch.float64).to(device)
-    mask = c>0
-    loss = c[mask].sum()
-    return loss
-
 def train(env_name,train_steps = 200000,suffix="",all_loss=0,\
             encode_dim = 20,layer_depth=3,e_loss=1,gamma=0.5):
     np.random.seed(98)
-    Ktrain_samples = 1000
-    # Ktest_samples = 1000
-    # # Ktrain_samples = 50000
+    Ktrain_samples = 50000
     Ktest_samples = 20000
-    Ksteps = 10
-    Kbatch_size = 512
+    Ktrainsteps = 15
+    Kteststeps = 30
+    Kbatch_size = 100
     u_dim = 7
     #data prepare
     data_collect = data_collecter(env_name)
-    Ktest_data = data_collect.collect_koopman_data(Ktest_samples,Ksteps)
+    Ktest_data = data_collect.collect_koopman_data(Ktest_samples,Kteststeps)
     print("test data ok!")
-    Ktrain_data = data_collect.collect_koopman_data(Ktrain_samples,Ksteps)
+    Ktrain_data = data_collect.collect_koopman_data(Ktrain_samples,Ktrainsteps)
     print("train data ok!")
     # savemat('FrankaTrainingData.mat',{'Train_data':Ktrain_data,'Test_data':Ktest_data})
     # raise NotImplementedError
@@ -285,12 +304,11 @@ def train(env_name,train_steps = 200000,suffix="",all_loss=0,\
     control_encode_layers = [control_input_dim] + [layer_width] * layer_depth + [b_dim]
     Nkoopman = state_output_dim
     net = Network(state_encode_layers, control_encode_layers, Nkoopman, u_dim, control_output_dim)
-    # print(net.named_modules())
-    eval_step = 1000
-    learning_rate = 1e-3
     if torch.cuda.is_available():
         net.cuda() 
     net.double()
+    eval_step = 1000
+    learning_rate = 1e-3
     mse_loss = nn.MSELoss()
     emb_loss = ManifoldEmbLoss()
     optimizer = torch.optim.Adam(net.parameters(),
@@ -301,14 +319,15 @@ def train(env_name,train_steps = 200000,suffix="",all_loss=0,\
     eval_step = 1000
     best_loss = 1000.0
     best_state_dict = {}
-    subsuffix = suffix+"KK_"+env_name+"layer{}_edim{}_eloss{}_gamma{}_aloss{}".format(layer_depth,encode_dim,e_loss,gamma,all_loss)
+    subsuffix = suffix+"KK_MCDKN"+env_name+"layer{}_edim{}_eloss{}_gamma{}_aloss{}".format(layer_depth,encode_dim,e_loss,gamma,all_loss)
     logdir = "Data/"+suffix+"/"+subsuffix
     if not os.path.exists( "Data/"+suffix):
         os.makedirs( "Data/"+suffix)
     if not os.path.exists(logdir):
         os.makedirs(logdir)
     writer = SummaryWriter(log_dir=logdir)
-    for i in range(train_steps):
+    pbar = tqdm.trange(train_steps)
+    for i in pbar:
         #K loss
         Kindex = list(range(Ktrain_samples))
         random.shuffle(Kindex)
@@ -319,31 +338,42 @@ def train(env_name,train_steps = 200000,suffix="",all_loss=0,\
         optimizer.zero_grad()
         total_loss.backward()
         optimizer.step() 
-        writer.add_scalar('Train/pred_loss',pred_loss,i)
-        writer.add_scalar('Train/control_loss',control_loss,i)
-        writer.add_scalar('Train/recon_loss',recon_loss,i)
-        writer.add_scalar('Train/geom_loss',geom_loss,i)
         writer.add_scalar('Train/total_loss', total_loss, i)
+        writer.add_scalar('Train/pred_loss', pred_loss, i)
+        writer.add_scalar('Train/geom_loss', geom_loss, i)
+        writer.add_scalar('Train/control_loss', control_loss, i)
+        writer.add_scalar('Train/recon_loss', recon_loss, i)
+        
         # print("Step:{} Loss:{}".format(i,loss.detach().cpu().numpy()))
-        if (i+1) % eval_step ==0:
-            #K loss
-            total_loss, Kloss, control_loss, geom_loss, recon_loss = Klinear_loss_with_manifold(Ktest_data,net, mse_loss, emb_loss, u_dim,gamma,Nstate,all_loss,lambda_control=0,lambda_geom=0,lambda_recon=0)
-            Eloss = Eig_loss(net)
-            loss = Kloss+Eloss if e_loss else Kloss
-            Kloss = Kloss.detach().cpu().numpy()
-            Eloss = Eloss.detach().cpu().numpy()
-            loss = loss.detach().cpu().numpy()
-            writer.add_scalar('Eval/Kloss',Kloss,i)
-            writer.add_scalar('Eval/Eloss',Eloss,i)
-            writer.add_scalar('Eval/loss',loss,i)
-            if loss<best_loss:
-                best_loss = copy(Kloss)
-                best_state_dict = copy(net.state_dict())
-                Saved_dict = {'model':best_state_dict,'state_encode_layers': state_encode_layers, 'control_encode_layers': control_encode_layers}
-                torch.save(Saved_dict,"Data/"+subsuffix+".pth")
-            print("Step:{} Eval-loss:{} K-loss:{} E-loss:{}".format(i,loss,Kloss,Eloss))
-            # print("-------------END-------------")
-    print("END-best_loss{}".format(best_loss))
+        # 评估和保存模型
+        if (i + 1) % eval_step == 0:
+            for param_group in optimizer.param_groups:
+                param_group['lr'] *= 0.9999999
+            with torch.no_grad():
+                loss1, eval_loss, _, _, _ = Klinear_loss_with_manifold(
+                    Ktest_data, net, mse_loss, emb_loss, u_dim, gamma, 
+                    Nstate, all_loss=0, detach=1, lambda_geom=0, lambda_control=0, lambda_recon=0
+                )
+                eval_loss_val = eval_loss.detach().cpu().numpy().item()
+                
+                writer.add_scalar('Eval/loss', eval_loss_val, i)
+                
+                if eval_loss_val < best_loss:
+                    best_loss = copy(eval_loss_val)
+                    best_state_dict = copy(net.state_dict())
+                    Saved_dict = {
+                        'model': best_state_dict, 
+                        'Statelayer': state_encode_layers, 
+                        'Controllayer': control_encode_layers,
+                    }
+                    torch.save(Saved_dict, logdir + ".pth")
+                
+                print(f"Method:DKNgxu 步骤: {i}, 评估损失: {eval_loss_val}, 最佳损失: {best_loss}")
+        
+        writer.add_scalar('Eval/best_loss', best_loss, i)
+    
+    print(f"训练结束，最佳损失: {best_loss}")
+    return best_loss
     
 
 def main():
@@ -354,7 +384,7 @@ def main():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--env",type=str,default="Franka")
-    parser.add_argument("--suffix",type=str,default="")
+    parser.add_argument("--suffix",type=str,default="MCDKN")
     parser.add_argument("--all_loss",type=int,default=1)
     parser.add_argument("--eloss",type=int,default=0)
     parser.add_argument("--gamma",type=float,default=0.8)

@@ -9,6 +9,7 @@ from collections import OrderedDict
 from copy import copy
 import argparse
 import os
+import sys
 from torch.utils.tensorboard import SummaryWriter
 from scipy.integrate import odeint
 # physics engine
@@ -17,7 +18,6 @@ import pybullet_data
 from scipy.io import loadmat, savemat
 # Franka simulator
 from franka_env import FrankaEnv
-
 #data collect
 def Obs(o):
     return np.concatenate((o[:3],o[7:]),axis=0)
@@ -54,91 +54,107 @@ def gaussian_init_(n_units, std=1):
     Omega = sampler.sample((n_units, n_units))[..., 0]  
     return Omega
     
+#define network
 class Network(nn.Module):
-    def __init__(self,encode_layers,Nkoopman,u_dim):
-        super(Network,self).__init__()
-        Layers = OrderedDict()
-        for layer_i in range(len(encode_layers)-1):
-            Layers["linear_{}".format(layer_i)] = nn.Linear(encode_layers[layer_i],encode_layers[layer_i+1])
-            if layer_i != len(encode_layers)-2:
-                Layers["relu_{}".format(layer_i)] = nn.ReLU()
-        self.encode_net = nn.Sequential(Layers)
-        self.Nkoopman = Nkoopman
-        self.u_dim = u_dim
-        self.lA = nn.Linear(Nkoopman,Nkoopman,bias=False)
-        self.lA.weight.data = gaussian_init_(Nkoopman, std=1)
-        U, _, V = torch.svd(self.lA.weight.data)
-        self.lA.weight.data = torch.mm(U, V.t()) * 0.9
-        self.lB = nn.Linear(u_dim,Nkoopman,bias=False)
+    def __init__(self, input_size, output_size, hidden_dim, n_layers,device=None):
+        super(Network, self).__init__()
 
-    def encode(self,x):
-        return torch.cat([x,self.encode_net(x)],axis=-1)
+        # Defining some parameters
+        self.hidden_dim = hidden_dim
+        self.n_layers = n_layers
+
+        #Defining the layers
+        # RNN Layer
+        self.rnn = nn.RNN(input_size, hidden_dim, n_layers, batch_first=True)   
+        # Fully connected layer
+        self.fc = nn.Linear(hidden_dim, output_size)
+        self.device = torch.device(device) if device else torch.device("cuda")
     
-    def forward(self,x,u):
-        return self.lA(x)+self.lB(u)
+    def forward(self, x,hidden=None):
+        
+        batch_size = x.size(0)
+
+        # Initializing hidden state for first input using method defined below
+        if hidden is None:
+            hidden = self.init_hidden(batch_size)
+
+        # Passing in the input and hidden state into the model and obtaining outputs
+        out, hidden = self.rnn(x, hidden)
+        
+        # Reshaping the outputs such that it can be fit into the fully connected layer
+        # out = out.contiguous().view(-1, self.hidden_dim)
+        out = self.fc(out)
+        
+        return out, hidden
+    
+    def init_hidden(self, batch_size):
+        # This method generates the first hidden state of zeros which we'll use in the forward pass
+        # We'll send the tensor holding the hidden state to the device we specified earlier as well
+        hidden = torch.zeros(self.n_layers, batch_size, self.hidden_dim).to(self.device).double()
+        return hidden
+
+def K_loss(data,net,u_dim=1,Nstate=4):
+    steps,train_traj_num,Nstates = data.shape
+    device = net.device
+    data = torch.DoubleTensor(data).to(device)
+    X_pred,hidden = net.forward(data[:steps-1,:,:])
+    max_loss_list = []
+    mean_loss_list = []
+    for i in range(steps-1):
+        X_current = X_pred[i,:,:]
+        Y = data[i+1,:,u_dim:]
+        Err = X_current-Y
+        max_loss_list.append(torch.mean(torch.max(torch.abs(Err),axis=0).values).detach().cpu().numpy())
+        mean_loss_list.append(torch.mean(torch.mean(torch.abs(Err),axis=0)).detach().cpu().numpy())
+    return np.array(max_loss_list),np.array(mean_loss_list)
+
 
 #loss function
 def Klinear_loss(data,net,mse_loss,u_dim=1,gamma=0.99,Nstate=4,all_loss=0):
-    steps,train_traj_num,NKoopman = data.shape
+    steps,train_traj_num,Nstates = data.shape
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     data = torch.DoubleTensor(data).to(device)
-    X_current = net.encode(data[0,:,u_dim:])
+    X_pred,hidden = net.forward(data[:steps-1,:,:])
     beta = 1.0
     beta_sum = 0.0
     loss = torch.zeros(1,dtype=torch.float64).to(device)
     for i in range(steps-1):
-        X_current = net.forward(X_current,data[i,:,:u_dim])
+        X_current = X_pred[i,:,:]
+        Y = data[i+1,:,u_dim:]
         beta_sum += beta
-        if not all_loss:
-            loss += beta*mse_loss(X_current[:,:Nstate],data[i+1,:,u_dim:])
-        else:
-            Y = net.encode(data[i+1,:,u_dim:])
-            loss += beta*mse_loss(X_current,Y)
+        loss += beta*mse_loss(X_current,Y)
         beta *= gamma
     loss = loss/beta_sum
-    return loss
-
-def Stable_loss(net,Nstate):
-    x_ref = np.zeros(Nstate)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    x_ref_lift = net.encode_only(torch.DoubleTensor(x_ref).to(device))
-    loss = torch.norm(x_ref_lift)
-    return loss
-
-def Eig_loss(net):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    A = net.lA.weight
-    c = torch.linalg.eigvals(A).abs()-torch.ones(1,dtype=torch.float64).to(device)
-    mask = c>0
-    loss = c[mask].sum()
     return loss
 
 def train(env_name,train_steps = 300000,suffix="",all_loss=0,\
             encode_dim = 20,layer_depth=3,e_loss=1,gamma=0.5):
     np.random.seed(98)
-    # Ktrain_samples = 100
-    # Ktest_samples = 100
+    # Ktrain_samples = 1000
+    # Ktest_samples = 1000
     Ktrain_samples = 50000
     Ktest_samples = 20000
     Ktrainsteps = 15
     Kteststeps = 30
     Kbatch_size = 100
-    u_dim = 7
+    res = 1
+    normal = 1
+    gamma = 0.8
     #data prepare
     data_collect = data_collecter(env_name)
+    u_dim = data_collect.udim
     Ktest_data = data_collect.collect_koopman_data(Ktest_samples,Kteststeps)
     print("test data ok!")
     Ktrain_data = data_collect.collect_koopman_data(Ktrain_samples,Ktrainsteps)
     print("train data ok!")
-    # savemat('FrankaTrainingData.mat',{'Train_data':Ktrain_data,'Test_data':Ktest_data})
-    # raise NotImplementedError
     in_dim = Ktest_data.shape[-1]-u_dim
     Nstate = in_dim
+    # layer_depth = 4
     layer_width = 128
-    layers = [in_dim]+[layer_width]*layer_depth+[encode_dim]
-    Nkoopman = in_dim+encode_dim
-    print("layers:",layers)
-    net = Network(layers,Nkoopman,u_dim)
+    Elayers = [in_dim+u_dim]+[layer_width]*layer_depth+[in_dim]
+    # Blayers = [in_dim]+[layer_width]*layer_depth+[in_dim*u_dim]
+    print("layers:",Elayers)
+    net = Network(input_size =in_dim+u_dim, output_size=in_dim, hidden_dim=128, n_layers=layer_depth-1)
     # print(net.named_modules())
     eval_step = 1000
     learning_rate = 1e-3
@@ -151,10 +167,10 @@ def train(env_name,train_steps = 300000,suffix="",all_loss=0,\
     for name, param in net.named_parameters():
         print("model:",name,param.requires_grad)
     #train
-    eval_step = 1000
+    eval_step = 500
     best_loss = 1000.0
     best_state_dict = {}
-    subsuffix = suffix+"KK_Koopmanlinear"+env_name+"layer{}_edim{}_eloss{}_gamma{}_aloss{}".format(layer_depth,encode_dim,e_loss,gamma,all_loss)
+    subsuffix = suffix+"KK_KNonlinearRNN"+env_name+"layer{}_edim{}_eloss{}_gamma{}_aloss{}".format(layer_depth,encode_dim,e_loss,gamma,all_loss)
     logdir = "Data/"+suffix+"/"+subsuffix
     if not os.path.exists( "Data/"+suffix):
         os.makedirs( "Data/"+suffix)
@@ -166,34 +182,33 @@ def train(env_name,train_steps = 300000,suffix="",all_loss=0,\
         Kindex = list(range(Ktrain_samples))
         random.shuffle(Kindex)
         X = Ktrain_data[:,Kindex[:Kbatch_size],:]
-        Kloss = Klinear_loss(X,net,mse_loss,u_dim,gamma,Nstate,all_loss)
-        Eloss = Eig_loss(net)
-        loss = Kloss+Eloss if e_loss else Kloss
+        Kloss = Klinear_loss(X,net,mse_loss,u_dim,gamma)
         optimizer.zero_grad()
-        loss.backward()
+        Kloss.backward()
         optimizer.step() 
-        writer.add_scalar('Train/Kloss',Kloss,i)
-        writer.add_scalar('Train/Eloss',Eloss,i)
-        writer.add_scalar('Train/loss',loss,i)
+        writer.add_scalar('Train/loss',Kloss,i)
         # print("Step:{} Loss:{}".format(i,loss.detach().cpu().numpy()))
         if (i+1) % eval_step ==0:
             #K loss
-            Kloss = Klinear_loss(Ktest_data,net,mse_loss,u_dim,gamma,Nstate,all_loss)
-            Eloss = Eig_loss(net)
-            loss = Kloss+Eloss if e_loss else Kloss
-            Kloss = Kloss.detach().cpu().numpy()
-            Eloss = Eloss.detach().cpu().numpy()
-            loss = loss.detach().cpu().numpy()
-            writer.add_scalar('Eval/Kloss',Kloss,i)
-            writer.add_scalar('Eval/Eloss',Eloss,i)
-            writer.add_scalar('Eval/loss',loss,i)
-            if loss<best_loss:
-                best_loss = copy(Kloss)
-                best_state_dict = copy(net.state_dict())
-                Saved_dict = {'model':best_state_dict,'layer':layers}
-                torch.save(Saved_dict,"Data/"+subsuffix+".pth")
-            print("Step:{} Eval-loss{} K-loss:{} E-loss:{}".format(i,loss,Kloss,Eloss))
+            with torch.no_grad():
+                Kloss = Klinear_loss(Ktest_data,net,mse_loss,u_dim,gamma)
+                # if auto_first and i<10000:
+                #     loss = AEloss
+                # else:
+                writer.add_scalar('Eval/loss',Kloss,i)
+                writer.add_scalar('Eval/best_loss',best_loss,i)
+                if Kloss<best_loss:
+                    best_loss = copy(Kloss)
+                    best_state_dict = copy(net.state_dict())
+                    Saved_dict = {'model':best_state_dict,'Elayer':Elayers}
+                    torch.save(Saved_dict,logdir+".pth")
+                    # print(logdir+".pth")
+                print("Method:KNonlinearRNN Step:{} Eval K-loss:{} ".format(i,Kloss.detach().cpu().numpy()))
             # print("-------------END-------------")
+        writer.add_scalar('Eval/best_loss',best_loss,i)
+        # if (time.process_time()-start_time)>=210*3600:
+        #     print("time out!:{}".format(time.clock()-start_time))
+        #     break
     print("END-best_loss{}".format(best_loss))
     
 

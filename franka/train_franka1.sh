@@ -1,0 +1,2 @@
+python Learn_Koopman_with_Klinear_Franka.py
+python Learn_Knonlinear_RNN_Franka.py
