@@ -11,6 +11,7 @@ import argparse
 import sys
 import os
 sys.path.append("../utility/")
+sys.path.append("../")
 from torch.utils.tensorboard import SummaryWriter
 from torchdiffeq import odeint
 # from scipy.integrate import odeint
@@ -75,7 +76,7 @@ def gaussian_init_(n_units, std=1):
     
 
 class Network(nn.Module):
-    def __init__(self, state_encode_layers, control_encode_layers, Nkoopman, u_dim, control_output_dim):
+    def __init__(self, state_encode_layers, control_encode_layers, Nkoopman, u_dim, control_output_dim, device=None):
         super(Network, self).__init__()
         Statelayers = OrderedDict()
         for layer_i in range(len(state_encode_layers)-1):
@@ -99,6 +100,9 @@ class Network(nn.Module):
         self.lA.weight.data = torch.mm(U, V.t()) * 0.9
         # self.lB = nn.Linear(belayers[-1], Nkoopman, bias=False)
         self.lB = nn.Linear(control_output_dim, Nkoopman, bias=False)
+        self.device = torch.device(device) if device else torch.device("cuda")
+
+
     # 状态提升
     def encode(self, x):
         return torch.cat([x, self.state_encoder(x)], axis=-1)
@@ -115,16 +119,17 @@ class Network(nn.Module):
 # 计算Kloss
 def K_loss(data, net, u_dim=1, Nstate=4):
     steps, train_traj_num, Nstates = data.shape
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = net.device
     data = torch.DoubleTensor(data).to(device)
     Z_current = net.encode(data[0,:,u_dim:])
     max_loss_list = []
     mean_loss_list = []
     for i in range(steps-1):
-        bilinear = net.bicode(Z_current.detach(), data[i,:,:u_dim])
-        Z_current = net.forward(Z_current, bilinear)
+        hat_u = net.control_encode(Z_current, data[i,:,:u_dim])
+        Z_next = net.forward(Z_current, hat_u)
         Y = data[i+1,:,u_dim:]
-        Err = Z_current[:,:Nstate] - Y
+        Err = Z_next[:,:Nstate] - Y
+        Z_current = Z_next
         max_loss_list.append(torch.mean(torch.max(torch.abs(Err), axis=0).values).detach().cpu().numpy())
         mean_loss_list.append(torch.mean(torch.mean(torch.abs(Err), axis=0)).detach().cpu().numpy())
     return np.array(max_loss_list), np.array(mean_loss_list)
@@ -165,36 +170,39 @@ def Klinear_loss_with_manifold(data, net, mse_loss, emb_loss, u_dim=1, gamma=0.9
     pred_loss = torch.tensor(0.0, dtype=torch.float64, device=device)
     control_loss = torch.tensor(0.0, dtype=torch.float64, device=device)
     recon_loss = torch.tensor(0.0, dtype=torch.float64, device=device)
+    Augloss = torch.tensor(0.0, dtype=torch.float64, device=device)
     # Z_current[:,:Nstate] = X_current
     for i in range(steps-1):
         hat_u = net.control_encode(Z_current if detach else Z_current, 
                              data[i,:,:u_dim])
         Z_next = net.forward(Z_current, hat_u)
         beta_sum += beta
-        Z_next_encoded = net.encode(data[i+1,:,u_dim:])
         # Koopman线性性约束
         if not all_loss:
             pred_loss += beta * mse_loss(Z_next[:,:Nstate], data[i+1,:,u_dim:])
         else:
+            Z_next_encoded = net.encode(data[i+1,:,u_dim:])
             pred_loss += beta * mse_loss(Z_next, Z_next_encoded)
         # 重建误差        
-        x_rec = Z_current[:,:Nstate] 
         u_rec = hat_u[:,:u_dim]
         # recon_loss += (mse_loss(u_rec, data[i,:,:u_dim]) + mse_loss(x_rec, data[i:,:,u_dim:]))
+        Z_aug = net.encode(Z_current[:,:Nstate])
+        Augloss += mse_loss(Z_current, Z_aug)
         recon_loss += mse_loss(u_rec, data[i,:,:u_dim])
         Z_current = Z_next
         beta *= gamma
     
-    pred_loss = pred_loss / beta_sum if beta_sum > 0 else pred_loss
+    # pred_loss = pred_loss / beta_sum if beta_sum > 0 else pred_loss
+    Augloss = Augloss / beta_sum if beta_sum > 0 else pred_loss
 
     if lambda_control > 0:
         control_loss = Eig_loss(net) + Controlability_loss(net)
-        control_loss = control_loss / beta_sum if beta_sum > 0 else control_loss
+        # control_loss = control_loss / beta_sum if beta_sum > 0 else control_loss
 
     if lambda_recon > 0:
         recon_loss = recon_loss / beta_sum if beta_sum > 0 else recon_loss
 
-    total_loss = pred_loss + lambda_geom * geom_loss + lambda_control * control_loss + lambda_recon * recon_loss
+    total_loss = pred_loss+ 0.5*Augloss + lambda_geom * geom_loss + lambda_control * control_loss + lambda_recon * recon_loss
 
     return total_loss, pred_loss, control_loss, geom_loss, recon_loss
 
@@ -315,7 +323,7 @@ def train(env_name, train_steps=200000, suffix="", all_loss=0,
             for param_group in optimizer.param_groups:
                 param_group['lr'] *= 0.9999999
             with torch.no_grad():
-                eval_loss, _, _, _, _ = Klinear_loss_with_manifold(
+                loss1, eval_loss, _, _, _ = Klinear_loss_with_manifold(
                     Ktest_data, net, mse_loss, emb_loss, u_dim, gamma, 
                     Nstate, all_loss=0, detach=detach, lambda_geom=0, lambda_control=0, lambda_recon=0
                 )

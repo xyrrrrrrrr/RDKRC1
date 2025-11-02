@@ -12,6 +12,7 @@ import os
 from torch.utils.tensorboard import SummaryWriter
 import sys
 sys.path.append("../utility/")
+sys.path.append("../")
 from scipy.integrate import odeint
 from Utility import data_collecter
 import time
@@ -22,7 +23,7 @@ def gaussian_init_(n_units, std=1):
     return Omega
     
 class Network(nn.Module):
-    def __init__(self,encode_layers,Nkoopman,u_dim):
+    def __init__(self,encode_layers,Nkoopman,u_dim, device=None):
         super(Network,self).__init__()
         Layers = OrderedDict()
         for layer_i in range(len(encode_layers)-1):
@@ -37,7 +38,7 @@ class Network(nn.Module):
         U, _, V = torch.svd(self.lA.weight.data)
         self.lA.weight.data = torch.mm(U, V.t()) * 0.9
         self.lB = nn.Linear(u_dim,Nkoopman,bias=False)
-
+        self.device = torch.device(device) if device else torch.device("cuda")
     def encode_only(self,x):
         return self.encode_net(x)
 
@@ -49,7 +50,7 @@ class Network(nn.Module):
 
 def K_loss(data,net,u_dim=1,Nstate=4):
     steps,train_traj_num,Nstates = data.shape
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = net.device
     data = torch.DoubleTensor(data).to(device)
     X_current = net.encode(data[0,:,u_dim:])
     max_loss_list = []

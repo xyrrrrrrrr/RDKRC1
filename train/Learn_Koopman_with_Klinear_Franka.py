@@ -10,6 +10,7 @@ from copy import copy
 import argparse
 import sys
 sys.path.append("../utility/")
+sys.path.append("../")
 from torch.utils.tensorboard import SummaryWriter
 from scipy.integrate import odeint
 # physics engine
@@ -56,7 +57,7 @@ def gaussian_init_(n_units, std=1):
     return Omega
     
 class Network(nn.Module):
-    def __init__(self,encode_layers,Nkoopman,u_dim):
+    def __init__(self,encode_layers,Nkoopman,u_dim,device=None):
         super(Network,self).__init__()
         Layers = OrderedDict()
         for layer_i in range(len(encode_layers)-1):
@@ -71,6 +72,7 @@ class Network(nn.Module):
         U, _, V = torch.svd(self.lA.weight.data)
         self.lA.weight.data = torch.mm(U, V.t()) * 0.9
         self.lB = nn.Linear(u_dim,Nkoopman,bias=False)
+        self.device = torch.device(device) if device else torch.device("cuda")
 
     def encode(self,x):
         return torch.cat([x,self.encode_net(x)],axis=-1)
@@ -81,7 +83,7 @@ class Network(nn.Module):
 #loss function
 def Klinear_loss(data,net,mse_loss,u_dim=1,gamma=0.99,Nstate=4,all_loss=0):
     steps,train_traj_num,NKoopman = data.shape
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = net.device
     data = torch.DoubleTensor(data).to(device)
     X_current = net.encode(data[0,:,u_dim:])
     beta = 1.0

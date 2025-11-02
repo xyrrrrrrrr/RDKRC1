@@ -11,6 +11,7 @@ import argparse
 import sys
 import os
 sys.path.append("../utility/")
+sys.path.append("../")
 from torch.utils.tensorboard import SummaryWriter
 from scipy.integrate import odeint
 from Utility import data_collecter
@@ -19,7 +20,7 @@ import time
 #define network
 
 class Network(nn.Module):
-    def __init__(self,layers,u_dim,activation_mode="ReLU"):
+    def __init__(self,layers,u_dim,activation_mode="ReLU", device="cuda"):
         super(Network,self).__init__()
         ELayers = OrderedDict()
         for layer_i in range(len(layers)-1):
@@ -30,7 +31,7 @@ class Network(nn.Module):
                 else:
                     ELayers["relu_{}".format(layer_i)] = nn.ReLU()
         self.Enet = nn.Sequential(ELayers)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(device) if device else torch.device("cuda")
         # BLayers = OrderedDict()
         # for layer_i in range(len(B_layers)-1):
         #     BLayers["linear_{}".format(layer_i)] = nn.Linear(B_layers[layer_i],B_layers[layer_i+1])
@@ -53,7 +54,7 @@ class Network(nn.Module):
 
 def K_loss(data,net,u_dim=1,Nstate=4):
     steps,train_traj_num,Nstates = data.shape
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = net.device
     data = torch.DoubleTensor(data).to(device)
     X_current = data[0,:,u_dim:]
     max_loss_list = []
@@ -70,7 +71,7 @@ def K_loss(data,net,u_dim=1,Nstate=4):
 #loss function
 def Klinear_loss(data,net,mse_loss,u_dim=1,gamma=0.99,Nstate=4,all_loss=0):
     steps,train_traj_num,Nstates = data.shape
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(data.device)
     data = torch.DoubleTensor(data).to(device)
     X_current = data[0,:,u_dim:]
     beta = 1.0

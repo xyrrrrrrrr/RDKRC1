@@ -11,6 +11,7 @@ import argparse
 import sys
 import os
 sys.path.append("../utility/")
+sys.path.append("../")
 from torch.utils.tensorboard import SummaryWriter
 from scipy.integrate import odeint
 from Utility import data_collecter
@@ -18,7 +19,7 @@ import time
         
 #define network
 class Network(nn.Module):
-    def __init__(self, input_size, output_size, hidden_dim, n_layers):
+    def __init__(self, input_size, output_size, hidden_dim, n_layers,device=None):
         super(Network, self).__init__()
 
         # Defining some parameters
@@ -30,7 +31,7 @@ class Network(nn.Module):
         self.rnn = nn.RNN(input_size, hidden_dim, n_layers, batch_first=True)   
         # Fully connected layer
         self.fc = nn.Linear(hidden_dim, output_size)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device(device) if device else torch.device("cuda")
     
     def forward(self, x,hidden=None):
         
@@ -57,7 +58,7 @@ class Network(nn.Module):
 
 def K_loss(data,net,u_dim=1,Nstate=4):
     steps,train_traj_num,Nstates = data.shape
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = net.device
     data = torch.DoubleTensor(data).to(device)
     X_pred,hidden = net.forward(data[:steps-1,:,:])
     max_loss_list = []
