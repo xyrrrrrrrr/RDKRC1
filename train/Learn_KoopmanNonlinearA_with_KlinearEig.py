@@ -16,6 +16,7 @@ from torch.utils.tensorboard import SummaryWriter
 from scipy.integrate import odeint
 from Utility import data_collecter
 import time
+import tqdm
 #define network
 def gaussian_init_(n_units, std=1):    
     sampler = torch.distributions.Normal(torch.Tensor([0]), torch.Tensor([std/n_units]))
@@ -113,13 +114,14 @@ def train(env_name,train_steps = 200000,suffix="",all_loss=0,\
     # Ktrain_samples = 1000
     # Ktest_samples = 1000
     Ktrain_samples = Ktrain_samples
-    Ktest_samples = 20000
+    Ktest_samples = 1000
     Ktrainsteps = 15
     Kteststeps = 30
     Kbatch_size = 100
     #data prepare
     data_collect = data_collecter(env_name)
     u_dim = data_collect.udim
+    b_dim = u_dim
     Ktest_data = data_collect.collect_koopman_data(Ktest_samples,Kteststeps,mode="eval")
     Ktest_samples = Ktest_data.shape[1]
     print("test data ok!,shape:",Ktest_data.shape)
@@ -157,7 +159,7 @@ def train(env_name,train_steps = 200000,suffix="",all_loss=0,\
         os.makedirs(logdir)
     writer = SummaryWriter(log_dir=logdir)
     start_time = time.process_time()
-    for i in range(train_steps):
+    for i in tqdm.trange(train_steps):
         #K loss
         Kindex = list(range(Ktrain_samples))
         random.shuffle(Kindex)

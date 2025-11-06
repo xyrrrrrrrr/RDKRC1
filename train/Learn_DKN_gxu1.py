@@ -145,10 +145,8 @@ class Network(nn.Module):
     # 控制编码
     def control_encode(self, gx, u):
         # u = self.normalize_u(u)
-        y = torch.cat([u, gx], axis=-1) 
-        gy = self.control_encoder(y)
-        return torch.cat([y, gy], axis=-1)
-        # return gy
+        gy = self.control_encoder(gx)
+        return u*gy
     # # 控制解码
     # def control_decode(self, hat_u):
     #     # return self.denormalize_u(self.control_decoder(hat_u))
@@ -230,7 +228,8 @@ def Klinear_loss_with_manifold(data, net, mse_loss, emb_loss, u_dim=1, gamma=0.9
         # Z_aug = net.encode(net.denormalize_x(Z_current[:,:Nstate]))
         Z_aug = net.encode(Z_current[:,:Nstate])
         Augloss += mse_loss(Z_current, Z_aug)
-        recon_loss += mse_loss(u_rec, data[i,:,:u_dim])
+        if lambda_recon > 0:
+            recon_loss += mse_loss(u_rec, data[i,:,:u_dim])
         Z_current = Z_next
         beta *= gamma
     
@@ -293,6 +292,7 @@ def train(env_name, train_steps=200000, suffix="", all_loss=0,
     # 数据准备
     data_collect = data_collecter(env_name)
     u_dim = data_collect.udim
+    b_dim = u_dim
     Ktest_data = data_collect.collect_koopman_data(20000, 30, mode="eval")
     print("测试数据准备完成，形状:", Ktest_data.shape)
     Ktrain_data = data_collect.collect_koopman_data(Ktrain_samples, 15, mode="train")
@@ -301,7 +301,7 @@ def train(env_name, train_steps=200000, suffix="", all_loss=0,
     Ktrain_samples = Ktrain_data.shape[1]
     in_dim = Ktest_data.shape[-1] - u_dim
     Nstate = in_dim
-    
+    print(in_dim)
     # 网络参数设置
     layer_width = 128
     state_input_dim = in_dim
@@ -310,7 +310,7 @@ def train(env_name, train_steps=200000, suffix="", all_loss=0,
     # control_output_dim = control_input_dim + b_dim
     control_output_dim = b_dim
     state_encode_layers = [state_input_dim] + [layer_width] * layer_depth + [encode_dim]
-    control_encode_layers = [control_input_dim] + [layer_width] * layer_depth + [b_dim]
+    control_encode_layers = [state_output_dim] + [layer_width] * layer_depth + [b_dim]
     Nkoopman = state_output_dim
     # state_max = data_collect.env.observation_space.high
     # state_min = data_collect.env.observation_space.low
@@ -408,7 +408,7 @@ def main():
     parser.add_argument("--layer_depth", type=int, default=3)
     parser.add_argument("--lambda_geom", type=float, default=0.1, help="流形几何约束权重")
     parser.add_argument("--lambda_control", type=float, default=0.1, help="控制约束权重")
-    parser.add_argument("--lambda_recon", type=float, default=0.3, help="重建约束权重")
+    parser.add_argument("--lambda_recon", type=float, default=0.0, help="重建约束权重")
     args = parser.parse_args()
     
     train(args.env, 

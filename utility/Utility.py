@@ -25,6 +25,8 @@ class RBFLiftFunc():
             lift_val = 8
         elif env_name.startswith("DoublePendulum"):
             lift_val = 8
+        elif env_name.startswith("LunarLanderContinuous-v2"):
+            lift_val = 12
         self.lift_low = np.clip(observation_space.low,-lift_val,lift_val)
         self.lift_high = np.clip(observation_space.high,-lift_val,lift_val)
         self.type = type
@@ -79,6 +81,14 @@ class DerivativeLiftFunc():
             self.NKoopman = self.Nstate+2
         elif self.env_name.startswith("MountainCarContinuous"):
             self.NKoopman = self.Nstate+2
+        else:
+            self.g = 9.8 
+            self.mc = 1.0
+            self.mp = 0.1
+            self.mt = self.mc+self.mp
+            self.l = 0.5
+            self.lp = self.mp*self.l
+            self.NKoopman = self.Nstate+2
 
     def Psi_s(self,s):
         psi = np.zeros(self.NKoopman)
@@ -105,6 +115,13 @@ class DerivativeLiftFunc():
             x,dx = s
             psi[self.Nstate] = 0.0025*np.cos(3*x)
             psi[self.Nstate+1] = -0.0025*np.sin(3*x)*dx
+        else:
+            x0, y0, vx, vy, th1, vth1, leg1, leg2 = s
+            sintheta = np.sin(th1)
+            costheta = np.cos(th1)
+            temp = (self.lp*vth1**2*sintheta)/self.mt
+            psi[self.Nstate] = (self.g*sintheta-costheta*temp)/(self.l*(4.0/3.0-self.mp*costheta**2/self.mt))
+            psi[self.Nstate+1] = temp - self.lp*psi[4]*costheta/self.mt
         return psi
 
     def Psi_su(self,s,u):
@@ -295,7 +312,11 @@ class data_collecter():
         if not self.env_name.endswith("Snake"):
             self.observation_space = self.env.observation_space
             self.env.reset()
-            self.dt = self.env.dt
+            if env_name.startswith("LunarLanderContinuous-v2"):
+                self.dt = 0.02
+                self.env.dt = 0.02
+            else:
+                self.dt = self.env.dt 
 
     def random_state(self):
         if self.env_name.startswith("DampingPendulum"):
@@ -324,12 +345,24 @@ class data_collecter():
             dth0 = random.uniform(-6,6)
             dth1 = random.uniform(-6,6)
             s0 = np.array([x0,th0,th1,dx0,dth0,dth1]) 
+
+        elif self.env_name.startswith("LunarLanderContinuous-v2"):
+            x0 = random.uniform(-0.1,0.1)
+            y0 = random.uniform(-0.1,0.1)
+            vx = random.uniform(-3,3)
+            vy = random.uniform(-3,3)
+            th1 = random.uniform(-0.3,0.3)
+            vth1 = random.uniform(-6,6)
+            leg1 = 0
+            leg2 = 0
+            s0 = np.array([x0, y0, vx, vy, th1, vth1, leg1, leg2])
         return np.array(s0)
 
     def collect_koopman_data(self,traj_num,steps,mode="train"):
+        import tqdm
         train_data = np.empty((steps+1,traj_num,self.Nstates+self.udim))
         if self.env_name.startswith("Franka"):
-            for traj_i in range(traj_num):
+            for traj_i in tqdm.trange(traj_num):
                 noise = (np.random.rand(7)-0.5)*2*0.2
                 joint_init = self.reset_joint_state+noise
                 joint_init = np.clip(joint_init,self.env.joint_low,self.env.joint_high)

@@ -121,8 +121,20 @@ class Network(nn.Module):
             Controllayers["linear_{}".format(layer_i)] = nn.Linear(control_encode_layers[layer_i], control_encode_layers[layer_i+1])
             if layer_i != len(control_encode_layers)-2:
                 Controllayers["relu_{}".format(layer_i)] = nn.ReLU()
-        self.control_encoder = nn.Sequential(Controllayers)  
-    
+        self.control_encoder = nn.Sequential(Controllayers) 
+        # Controldecoder = OrderedDict()
+        # print(range(len(control_encode_layers)-2, -1, -1))
+        # for i, layer_i in enumerate(range(len(control_encode_layers)-2, 0, -1)):
+        #     if i == 0:
+        #         Controldecoder["linear_{}".format(i)] = nn.Linear(control_output_dim, control_encode_layers[layer_i])
+        #     elif layer_i > 1:
+        #         Controldecoder["linear_{}".format(i)] = nn.Linear(control_encode_layers[layer_i+1], control_encode_layers[layer_i])
+        #     else:
+        #         Controldecoder["linear_{}".format(i)] = nn.Linear(control_encode_layers[layer_i+1], u_dim)
+        #     if i != len(control_encode_layers)-2:
+        #         Controldecoder["relu_{}".format(i)] = nn.ReLU()
+        # self.control_decoder = nn.Sequential(Controldecoder)
+
         self.Nkoopman = Nkoopman
         self.u_dim = u_dim
         self.lA = nn.Linear(Nkoopman, Nkoopman, bias=False)
@@ -132,17 +144,47 @@ class Network(nn.Module):
         # self.lB = nn.Linear(belayers[-1], Nkoopman, bias=False)
         self.lB = nn.Linear(control_output_dim, Nkoopman, bias=False)
         self.device = torch.device(device) if device else torch.device("cuda")
+    #     self.state_max = torch.tensor(state_max).to(self.device)
+    #     self.state_min = torch.tensor(state_min).to(self.device)
+    #     self.action_max = torch.tensor(action_max).to(self.device)
+    #     self.action_min = torch.tensor(action_min).to(self.device)
+    # # 归一化
+    # def normalize_x(self, x):
+    #     x_clamped = torch.clamp(x, self.state_min, self.state_max)
+    #     x_norm = (x_clamped - self.state_min) / (self.state_max - self.state_min + 1e-8)
+    #     return x_norm
+        
+    # # 反归一化：
+    # def denormalize_x(self, x):
+    #     return x * (self.state_max - self.state_min) + self.state_min
 
+    # # 归一化
+    # def normalize_u(self, u):
+    #     u_clamped = torch.clamp(u, self.action_min, self.action_max)
+    #     u_norm = (u_clamped - self.action_min) / (self.action_max - self.action_min + 1e-8)
+    #     return u_norm
+    
+    # # 反归一化：
+    # def denormalize_u(self, u):
+    #     return u * (self.action_max - self.action_min) + self.action_min
 
     # 状态提升
     def encode(self, x):
+        # x = self.normalize_x(x)
         return torch.cat([x, self.state_encoder(x)], axis=-1)
     
     # 控制编码
     def control_encode(self, gx, u):
+        # u = self.normalize_u(u)
         y = torch.cat([u, gx], axis=-1) 
         gy = self.control_encoder(y)
-        return torch.cat([y, gy], axis=-1)
+        # return torch.cat([y, gy], axis=-1)
+        return gy
+    
+    # # 控制解码
+    # def control_decode(self, hat_u):
+    #     # return self.denormalize_u(self.control_decoder(hat_u))
+    #     return self.control_decoder(hat_u)
 
     def forward(self, z, hat_u):
         return self.lA(z) + self.lB(hat_u)
@@ -167,7 +209,7 @@ def K_loss(data, net, u_dim=1, Nstate=4):
 
 # 带流形约束的损失函数
 def Klinear_loss_with_manifold(data, net, mse_loss, emb_loss, u_dim=1, gamma=0.99, 
-                               Nstate=4, all_loss=0, detach=0, lambda_geom=0.1, lambda_control=0.1, lambda_recon=0.3):
+                               Nstate=4, all_loss=0, detach=0, lambda_geom=0.1, lambda_control=0.1, lambda_recon=0.1):
     steps, train_traj_num, NKoopman = data.shape
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     data = torch.DoubleTensor(data).to(device)
@@ -217,6 +259,7 @@ def Klinear_loss_with_manifold(data, net, mse_loss, emb_loss, u_dim=1, gamma=0.9
         # 重建误差        
         u_rec = hat_u[:,:u_dim]
         # recon_loss += (mse_loss(u_rec, data[i,:,:u_dim]) + mse_loss(x_rec, data[i:,:,u_dim:]))
+        # Z_aug = net.encode(net.denormalize_x(Z_current[:,:Nstate]))
         Z_aug = net.encode(Z_current[:,:Nstate])
         Augloss += mse_loss(Z_current, Z_aug)
         recon_loss += mse_loss(u_rec, data[i,:,:u_dim])
@@ -274,11 +317,11 @@ def Controlability_loss(net):
     
     return loss.clamp(min=0.0)  # 确保损失非负（奇异值过小时才产生惩罚）
 
-def train(env_name,train_steps = 200000,suffix="",all_loss=0,\
+def train(env_name,train_steps = 300000,suffix="",all_loss=0,\
             encode_dim = 20,layer_depth=3,e_loss=1,gamma=0.5):
     np.random.seed(98)
     Ktrain_samples = 50000
-    Ktest_samples = 20000
+    Ktest_samples = 2000
     Ktrainsteps = 15
     Kteststeps = 30
     Kbatch_size = 100
@@ -299,7 +342,8 @@ def train(env_name,train_steps = 200000,suffix="",all_loss=0,\
     state_input_dim = in_dim
     state_output_dim = in_dim + encode_dim
     control_input_dim = u_dim + state_output_dim
-    control_output_dim = control_input_dim + b_dim
+    # control_output_dim = control_input_dim + b_dim
+    control_output_dim = b_dim
     state_encode_layers = [state_input_dim] + [layer_width] * layer_depth + [encode_dim]
     control_encode_layers = [control_input_dim] + [layer_width] * layer_depth + [b_dim]
     Nkoopman = state_output_dim
@@ -319,7 +363,7 @@ def train(env_name,train_steps = 200000,suffix="",all_loss=0,\
     eval_step = 1000
     best_loss = 1000.0
     best_state_dict = {}
-    subsuffix = suffix+"KK_MCDKN"+env_name+"layer{}_edim{}_eloss{}_gamma{}_aloss{}".format(layer_depth,encode_dim,e_loss,gamma,all_loss)
+    subsuffix = suffix+"KK_DKNGU"+env_name+"layer{}_edim{}_eloss{}_gamma{}_aloss{}".format(layer_depth,encode_dim,e_loss,gamma,all_loss)
     logdir = "Data/"+suffix+"/"+subsuffix
     if not os.path.exists( "Data/"+suffix):
         os.makedirs( "Data/"+suffix)
@@ -384,7 +428,7 @@ def main():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--env",type=str,default="Franka")
-    parser.add_argument("--suffix",type=str,default="MCDKN")
+    parser.add_argument("--suffix",type=str,default="")
     parser.add_argument("--all_loss",type=int,default=1)
     parser.add_argument("--eloss",type=int,default=0)
     parser.add_argument("--gamma",type=float,default=0.8)

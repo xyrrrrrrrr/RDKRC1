@@ -16,7 +16,7 @@ from torch.utils.tensorboard import SummaryWriter
 from scipy.integrate import odeint
 from Utility import data_collecter
 import time
-        
+import tqdm        
 #define network
 class Network(nn.Module):
     def __init__(self, input_size, output_size, hidden_dim, n_layers,device=None):
@@ -141,7 +141,7 @@ def train(env_name,train_steps = 200000,suffix="",augsuffix="",\
         os.makedirs(logdir)
     writer = SummaryWriter(log_dir=logdir)
     start_time = time.process_time()
-    for i in range(train_steps):
+    for i in tqdm.trange(train_steps):
         #K loss
         Kindex = list(range(Ktrain_samples))
         random.shuffle(Kindex)

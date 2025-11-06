@@ -1,8 +1,8 @@
+from ntpath import join
 import torch
 import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
-import gym
 import matplotlib.pyplot as plt
 import random
 from collections import OrderedDict
@@ -10,14 +10,47 @@ from copy import copy
 import argparse
 import sys
 import os
-sys.path.append("../utility/")
-sys.path.append("../")
-from torch.utils.tensorboard import SummaryWriter
-from torchdiffeq import odeint
-# from scipy.integrate import odeint
-from Utility import data_collecter
-import time
 import tqdm
+sys.path.append("../utility/")
+sys.path.append("../franka/")
+from torch.utils.tensorboard import SummaryWriter
+from scipy.integrate import odeint
+# physics engine
+import pybullet as pb
+import pybullet_data
+from scipy.io import loadmat, savemat
+# Franka simulator
+from franka_env import FrankaEnv
+
+#data collect
+def Obs(o):
+    return np.concatenate((o[:3],o[7:]),axis=0)
+
+class data_collecter():
+    def __init__(self,env_name) -> None:
+        self.env_name = env_name
+        self.env =  FrankaEnv(render = False)
+        self.Nstates = 17
+        self.uval = 0.12
+        self.udim = 7
+        self.reset_joint_state = np.array(self.env.reset_joint_state)
+
+    def collect_koopman_data(self,traj_num,steps):
+        train_data = np.empty((steps+1,traj_num,self.Nstates+self.udim))
+        for traj_i in range(traj_num):
+            noise = (np.random.rand(7)-0.5)*2*0.2
+            joint_init = self.reset_joint_state+noise
+            joint_init = np.clip(joint_init,self.env.joint_low,self.env.joint_high)
+            s0 = self.env.reset_state(joint_init)
+            s0 = Obs(s0)
+            u10 = (np.random.rand(7)-0.5)*2*self.uval
+            train_data[0,traj_i,:]=np.concatenate([u10.reshape(-1),s0.reshape(-1)],axis=0).reshape(-1)
+            for i in range(1,steps+1):
+                s0 = self.env.step(u10)
+                s0 = Obs(s0)
+                u10 = (np.random.rand(7)-0.5)*2*self.uval
+                train_data[i,traj_i,:]=np.concatenate([u10.reshape(-1),s0.reshape(-1)],axis=0).reshape(-1)
+        return train_data
 
 class ManifoldEmbLoss(nn.Module):
     def __init__(self, k=10):
@@ -67,14 +100,12 @@ class ManifoldEmbLoss(nn.Module):
 
         return loss
 
-
-# 定义网络初始化函数
+#define network
 def gaussian_init_(n_units, std=1):    
     sampler = torch.distributions.Normal(torch.Tensor([0]), torch.Tensor([std/n_units]))
     Omega = sampler.sample((n_units, n_units))[..., 0]  
     return Omega
     
-
 class Network(nn.Module):
     def __init__(self, state_encode_layers, control_encode_layers, Nkoopman, u_dim, control_output_dim, device=None):
         super(Network, self).__init__()
@@ -145,10 +176,8 @@ class Network(nn.Module):
     # 控制编码
     def control_encode(self, gx, u):
         # u = self.normalize_u(u)
-        y = torch.cat([u, gx], axis=-1) 
-        gy = self.control_encoder(y)
-        return torch.cat([y, gy], axis=-1)
-        # return gy
+        gy = self.control_encoder(gx)
+        return u*gy
     # # 控制解码
     # def control_decode(self, hat_u):
     #     # return self.denormalize_u(self.control_decoder(hat_u))
@@ -156,7 +185,7 @@ class Network(nn.Module):
 
     def forward(self, z, hat_u):
         return self.lA(z) + self.lB(hat_u)
-
+    
 # 计算Kloss
 def K_loss(data, net, u_dim=1, Nstate=4):
     steps, train_traj_num, Nstates = data.shape
@@ -230,7 +259,8 @@ def Klinear_loss_with_manifold(data, net, mse_loss, emb_loss, u_dim=1, gamma=0.9
         # Z_aug = net.encode(net.denormalize_x(Z_current[:,:Nstate]))
         Z_aug = net.encode(Z_current[:,:Nstate])
         Augloss += mse_loss(Z_current, Z_aug)
-        recon_loss += mse_loss(u_rec, data[i,:,:u_dim])
+        if lambda_recon > 0:
+            recon_loss += mse_loss(u_rec, data[i,:,:u_dim])
         Z_current = Z_next
         beta *= gamma
     
@@ -284,24 +314,28 @@ def Controlability_loss(net):
     loss = -min_singular + varepsilon  # 当最小奇异值 ≥ epsilon时，损失趋近于0
     
     return loss.clamp(min=0.0)  # 确保损失非负（奇异值过小时才产生惩罚）
-    
-# 主训练函数
-def train(env_name, train_steps=200000, suffix="", all_loss=0,
-          encode_dim=12, b_dim=4, layer_depth=3, e_loss=1, gamma=0.99,
-          detach=0, Ktrain_samples=50000, lambda_geom=0.1, lambda_control=0.1, lambda_recon=0.01):
-    
-    # 数据准备
+
+def train(env_name,train_steps = 300000,suffix="",all_loss=0,\
+            encode_dim = 20,layer_depth=3,e_loss=1,gamma=0.5):
+    np.random.seed(98)
+    Ktrain_samples = 50000
+    Ktest_samples = 2000
+    Ktrainsteps = 15
+    Kteststeps = 30
+    Kbatch_size = 100
+    u_dim = 7
+    #data prepare
     data_collect = data_collecter(env_name)
-    u_dim = data_collect.udim
-    Ktest_data = data_collect.collect_koopman_data(20000, 30, mode="eval")
-    print("测试数据准备完成，形状:", Ktest_data.shape)
-    Ktrain_data = data_collect.collect_koopman_data(Ktrain_samples, 15, mode="train")
-    print("训练数据准备完成，形状:", Ktrain_data.shape)
-    
-    Ktrain_samples = Ktrain_data.shape[1]
+    Ktest_data = data_collect.collect_koopman_data(Ktest_samples,Kteststeps)
+    print("test data ok!")
+    Ktrain_data = data_collect.collect_koopman_data(Ktrain_samples,Ktrainsteps)
+    print("train data ok!")
+    # savemat('FrankaTrainingData.mat',{'Train_data':Ktrain_data,'Test_data':Ktest_data})
+    # raise NotImplementedError
+    # 网络参数设置
     in_dim = Ktest_data.shape[-1] - u_dim
     Nstate = in_dim
-    
+    b_dim = u_dim
     # 网络参数设置
     layer_width = 128
     state_input_dim = in_dim
@@ -310,68 +344,58 @@ def train(env_name, train_steps=200000, suffix="", all_loss=0,
     # control_output_dim = control_input_dim + b_dim
     control_output_dim = b_dim
     state_encode_layers = [state_input_dim] + [layer_width] * layer_depth + [encode_dim]
-    control_encode_layers = [control_input_dim] + [layer_width] * layer_depth + [b_dim]
+    control_encode_layers = [state_output_dim] + [layer_width] * layer_depth + [b_dim]
     Nkoopman = state_output_dim
-    # state_max = data_collect.env.observation_space.high
-    # state_min = data_collect.env.observation_space.low
-    # action_max = data_collect.umax
-    # action_min = data_collect.umin
-    # 初始化模型
     net = Network(state_encode_layers, control_encode_layers, Nkoopman, u_dim, control_output_dim)
     if torch.cuda.is_available():
         net.cuda() 
-    
     net.double()
-    
-    # 优化器和损失函数
+    eval_step = 1000
+    learning_rate = 1e-3
     mse_loss = nn.MSELoss()
     emb_loss = ManifoldEmbLoss()
-    optimizer = torch.optim.Adam(net.parameters(), lr=1e-3)
-    
-    # 训练配置
-    eval_step = 500
+    optimizer = torch.optim.Adam(net.parameters(),
+                                    lr=learning_rate)
+    for name, param in net.named_parameters():
+        print("model:",name,param.requires_grad)
+    #train
+    eval_step = 1000
     best_loss = 1000.0
-
     best_state_dict = {}
-    
-    # 日志和保存路径
-    logdir = f"../Data/{suffix}/DKNGU_{env_name}_layer{layer_depth}_edim{encode_dim}_eloss{e_loss}_gamma{gamma}_aloss{all_loss}_detach{detach}_bdim{b_dim}_samples{Ktrain_samples}_geom{lambda_geom}_ta"
-    os.makedirs("../Data/" + suffix, exist_ok=True)
-    os.makedirs(logdir, exist_ok=True)
+    subsuffix = suffix+"KK_DKNGU"+env_name+"layer{}_edim{}_eloss{}_gamma{}_aloss{}".format(layer_depth,encode_dim,e_loss,gamma,all_loss)
+    logdir = "Data/"+suffix+"/"+subsuffix
+    if not os.path.exists( "Data/"+suffix):
+        os.makedirs( "Data/"+suffix)
+    if not os.path.exists(logdir):
+        os.makedirs(logdir)
     writer = SummaryWriter(log_dir=logdir)
-    print("开始训练带流形约束的DKN模型...")
     pbar = tqdm.trange(train_steps)
     for i in pbar:
-        # 随机采样批次
+        #K loss
         Kindex = list(range(Ktrain_samples))
         random.shuffle(Kindex)
-        X = Ktrain_data[:, Kindex[:100], :]
-        
-        # 计算带流形约束的损失
+        X = Ktrain_data[:,Kindex[:Kbatch_size],:]
         total_loss, pred_loss, control_loss, geom_loss, recon_loss = Klinear_loss_with_manifold(
-            X, net, mse_loss, emb_loss, u_dim, gamma, Nstate, all_loss, 
-            detach, lambda_geom, lambda_control, lambda_recon
+            X, net, mse_loss, emb_loss, u_dim, gamma, Nstate, 1
         )
-        pbar.set_postfix({"Total Loss": f"{total_loss}", "K-step Loss": f"{pred_loss}", "Control loss": f"{control_loss}", "Geometry Loss": f"{geom_loss}", "Reconstruct Loss": f"{recon_loss}"})
-        # 反向传播和优化
         optimizer.zero_grad()
         total_loss.backward()
         optimizer.step() 
-        
-        # 记录训练损失
         writer.add_scalar('Train/total_loss', total_loss, i)
         writer.add_scalar('Train/pred_loss', pred_loss, i)
         writer.add_scalar('Train/geom_loss', geom_loss, i)
         writer.add_scalar('Train/control_loss', control_loss, i)
         writer.add_scalar('Train/recon_loss', recon_loss, i)
         
-        
+        # print("Step:{} Loss:{}".format(i,loss.detach().cpu().numpy()))
         # 评估和保存模型
         if (i + 1) % eval_step == 0:
+            for param_group in optimizer.param_groups:
+                param_group['lr'] *= 0.9999999
             with torch.no_grad():
                 loss1, eval_loss, _, _, _ = Klinear_loss_with_manifold(
                     Ktest_data, net, mse_loss, emb_loss, u_dim, gamma, 
-                    Nstate, all_loss=0, detach=detach, lambda_geom=0, lambda_control=0, lambda_recon=0
+                    Nstate, all_loss=0, detach=1, lambda_geom=0, lambda_control=0, lambda_recon=0
                 )
                 eval_loss_val = eval_loss.detach().cpu().numpy().item()
                 
@@ -393,37 +417,22 @@ def train(env_name, train_steps=200000, suffix="", all_loss=0,
     
     print(f"训练结束，最佳损失: {best_loss}")
     return best_loss
+    
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--env", type=str, default="DampingPendulum")
-    parser.add_argument("--suffix", type=str, default="5_2_ode_constraint")
-    parser.add_argument("--all_loss", type=int, default=1)
-    parser.add_argument("--e_loss", type=int, default=0)
-    parser.add_argument("--K_train_samples", type=int, default=20000)
-    parser.add_argument("--gamma", type=float, default=0.8)
-    parser.add_argument("--encode_dim", type=int, default=20)
-    parser.add_argument("--b_dim", type=int, default=1)
-    parser.add_argument("--detach", type=int, default=1)
-    parser.add_argument("--layer_depth", type=int, default=3)
-    parser.add_argument("--lambda_geom", type=float, default=0.1, help="流形几何约束权重")
-    parser.add_argument("--lambda_control", type=float, default=0.1, help="控制约束权重")
-    parser.add_argument("--lambda_recon", type=float, default=0.3, help="重建约束权重")
-    args = parser.parse_args()
-    
-    train(args.env, 
-          suffix=args.suffix, 
-          all_loss=args.all_loss,
-          encode_dim=args.encode_dim, 
-          layer_depth=args.layer_depth,
-          e_loss=args.e_loss, 
-          gamma=args.gamma, 
-          detach=args.detach,
-          b_dim=args.b_dim, 
-          Ktrain_samples=args.K_train_samples,
-          lambda_geom=args.lambda_geom,
-          lambda_control=args.lambda_control,
-          lambda_recon=args.lambda_recon)
+    train(args.env,suffix=args.suffix,all_loss=args.all_loss,\
+        encode_dim=args.encode_dim,layer_depth=args.layer_depth,\
+            e_loss=args.eloss,gamma=args.gamma)
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--env",type=str,default="Franka")
+    parser.add_argument("--suffix",type=str,default="")
+    parser.add_argument("--all_loss",type=int,default=1)
+    parser.add_argument("--eloss",type=int,default=0)
+    parser.add_argument("--gamma",type=float,default=0.8)
+    parser.add_argument("--encode_dim",type=int,default=20)
+    parser.add_argument("--layer_depth",type=int,default=3)
+    args = parser.parse_args()
     main()
+
