@@ -147,7 +147,7 @@ class Network(nn.Module):
         # u = self.normalize_u(u)
         y = torch.cat([u, gx], axis=-1) 
         gy = self.control_encoder(y)
-        return torch.cat([y, gy], axis=-1)
+        return gy
         # return gy
     # # 控制解码
     # def control_decode(self, hat_u):
@@ -226,7 +226,8 @@ def Klinear_loss_with_manifold(data, net, mse_loss, emb_loss, u_dim=1, gamma=0.9
             pred_loss += beta * mse_loss(Z_next, Z_next_encoded)
         # 重建误差        
         u_rec = hat_u[:,:u_dim]
-        # recon_loss += (mse_loss(u_rec, data[i,:,:u_dim]) + mse_loss(x_rec, data[i:,:,u_dim:]))
+        if lambda_recon > 0:
+            recon_loss += mse_loss(u_rec, data[i,:,:u_dim])
         # Z_aug = net.encode(net.denormalize_x(Z_current[:,:Nstate]))
         Z_aug = net.encode(Z_current[:,:Nstate])
         Augloss += mse_loss(Z_current, Z_aug)
@@ -335,7 +336,7 @@ def train(env_name, train_steps=200000, suffix="", all_loss=0,
     best_state_dict = {}
     
     # 日志和保存路径
-    logdir = f"../Data/{suffix}/DKNGU_{env_name}_layer{layer_depth}_edim{encode_dim}_eloss{e_loss}_gamma{gamma}_aloss{all_loss}_detach{detach}_bdim{b_dim}_samples{Ktrain_samples}_geom{lambda_geom}_ta"
+    logdir = f"../Data/{suffix}/DKNGU_{env_name}_layer{layer_depth}_edim{encode_dim}_eloss{e_loss}_gamma{gamma}_aloss{all_loss}_detach{detach}_bdim{b_dim}_samples{Ktrain_samples}_geom{lambda_geom}_control{lambda_control}_recon{lambda_recon}_ta"
     os.makedirs("../Data/" + suffix, exist_ok=True)
     os.makedirs(logdir, exist_ok=True)
     writer = SummaryWriter(log_dir=logdir)
@@ -403,12 +404,12 @@ def main():
     parser.add_argument("--K_train_samples", type=int, default=20000)
     parser.add_argument("--gamma", type=float, default=0.8)
     parser.add_argument("--encode_dim", type=int, default=20)
-    parser.add_argument("--b_dim", type=int, default=1)
+    parser.add_argument("--b_dim", type=int, default=4)
     parser.add_argument("--detach", type=int, default=1)
     parser.add_argument("--layer_depth", type=int, default=3)
     parser.add_argument("--lambda_geom", type=float, default=0.1, help="流形几何约束权重")
     parser.add_argument("--lambda_control", type=float, default=0.1, help="控制约束权重")
-    parser.add_argument("--lambda_recon", type=float, default=0.3, help="重建约束权重")
+    parser.add_argument("--lambda_recon", type=float, default=0.1, help="重建约束权重")
     args = parser.parse_args()
     
     train(args.env, 

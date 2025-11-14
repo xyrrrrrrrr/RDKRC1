@@ -114,15 +114,15 @@ def Eig_loss(net):
     return loss
 
 def train(env_name,train_steps = 300000,suffix="",all_loss=0,\
-            encode_dim = 20,layer_depth=3,e_loss=1,gamma=0.5):
+            encode_dim = 20,layer_depth=3,e_loss=1,gamma=0.8):
     np.random.seed(98)
     # Ktrain_samples = 100
     # Ktest_samples = 100
     Ktrain_samples = 50000
     Ktest_samples = 20000
-    Ktrainsteps = 15
-    Kteststeps = 30
-    Kbatch_size = 100
+    Ktrainsteps = 10
+    Kteststeps = 10
+    Kbatch_size = 512
     u_dim = 7
     #data prepare
     data_collect = data_collecter(env_name)
@@ -139,6 +139,12 @@ def train(env_name,train_steps = 300000,suffix="",all_loss=0,\
     Nkoopman = in_dim+encode_dim
     print("layers:",layers)
     net = Network(layers,Nkoopman,u_dim)
+    # for file in os.listdir("./Data/"):
+    #     if file.startswith("KK_KoopmanU") and file.endswith(".pth"):
+    #         model_path = file  
+    # dicts = torch.load("./Data"+"/"+model_path)
+    # state_dict = dicts["model"]
+    # net.load_state_dict(state_dict)
     # print(net.named_modules())
     eval_step = 1000
     learning_rate = 1e-3

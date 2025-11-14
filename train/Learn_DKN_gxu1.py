@@ -58,6 +58,7 @@ class ManifoldEmbLoss(nn.Module):
         x_dist_max = torch.max(x_dist, dim=1, keepdim=True)[0]
         x_dist_max = torch.clamp(x_dist_max, min=1e-8)  # 防止过小导致梯度爆炸
         x_dist = x_dist / x_dist_max  # 归一化，避免尺度
+        
         z_dist_max = torch.max(z_dist, dim=1, keepdim=True)[0]
         z_dist_max = torch.clamp(z_dist_max, min=1e-8)  # 防止过小导致梯度爆炸
         z_dist = z_dist / z_dist_max  # 归一化，避免尺度
@@ -106,6 +107,7 @@ class Network(nn.Module):
 
         self.Nkoopman = Nkoopman
         self.u_dim = u_dim
+        self.Nstate = state_encode_layers[0]
         self.lA = nn.Linear(Nkoopman, Nkoopman, bias=False)
         self.lA.weight.data = gaussian_init_(Nkoopman, std=1)
         U, _, V = torch.svd(self.lA.weight.data)
@@ -117,25 +119,7 @@ class Network(nn.Module):
     #     self.state_min = torch.tensor(state_min).to(self.device)
     #     self.action_max = torch.tensor(action_max).to(self.device)
     #     self.action_min = torch.tensor(action_min).to(self.device)
-    # # 归一化
-    # def normalize_x(self, x):
-    #     x_clamped = torch.clamp(x, self.state_min, self.state_max)
-    #     x_norm = (x_clamped - self.state_min) / (self.state_max - self.state_min + 1e-8)
-    #     return x_norm
-        
-    # # 反归一化：
-    # def denormalize_x(self, x):
-    #     return x * (self.state_max - self.state_min) + self.state_min
 
-    # # 归一化
-    # def normalize_u(self, u):
-    #     u_clamped = torch.clamp(u, self.action_min, self.action_max)
-    #     u_norm = (u_clamped - self.action_min) / (self.action_max - self.action_min + 1e-8)
-    #     return u_norm
-    
-    # # 反归一化：
-    # def denormalize_u(self, u):
-    #     return u * (self.action_max - self.action_min) + self.action_min
 
     # 状态提升
     def encode(self, x):
@@ -145,6 +129,10 @@ class Network(nn.Module):
     # 控制编码
     def control_encode(self, gx, u):
         # u = self.normalize_u(u)
+        # y = torch.cat([u, gx], axis=1)
+        # gy = self.control_encoder(y)
+        # return gyX_current[:,:Nstate].detach()
+        # gx = gx[:,:self.Nstate]
         gy = self.control_encoder(gx)
         return u*gy
     # # 控制解码
@@ -302,15 +290,19 @@ def train(env_name, train_steps=200000, suffix="", all_loss=0,
     in_dim = Ktest_data.shape[-1] - u_dim
     Nstate = in_dim
     print(in_dim)
+    b_dim = u_dim
     # 网络参数设置
     layer_width = 128
     state_input_dim = in_dim
     state_output_dim = in_dim + encode_dim
-    control_input_dim = u_dim + state_output_dim
+    # control_input_dim = u_dim + state_output_dim
+    control_input_dim = in_dim
     # control_output_dim = control_input_dim + b_dim
     control_output_dim = b_dim
     state_encode_layers = [state_input_dim] + [layer_width] * layer_depth + [encode_dim]
+    # control_encode_layers = [control_input_dim] + [layer_width] * layer_depth + [b_dim]
     control_encode_layers = [state_output_dim] + [layer_width] * layer_depth + [b_dim]
+    # control_encode_layers = [in_dim] + [layer_width] * layer_depth + [b_dim]
     Nkoopman = state_output_dim
     # state_max = data_collect.env.observation_space.high
     # state_min = data_collect.env.observation_space.low
@@ -335,7 +327,7 @@ def train(env_name, train_steps=200000, suffix="", all_loss=0,
     best_state_dict = {}
     
     # 日志和保存路径
-    logdir = f"../Data/{suffix}/DKNGU_{env_name}_layer{layer_depth}_edim{encode_dim}_eloss{e_loss}_gamma{gamma}_aloss{all_loss}_detach{detach}_bdim{b_dim}_samples{Ktrain_samples}_geom{lambda_geom}_ta"
+    logdir = f"../Data/{suffix}/DKNGU_{env_name}_layer{layer_depth}_edim{encode_dim}_eloss{e_loss}_gamma{gamma}_aloss{all_loss}_detach{detach}_bdim{b_dim}_samples{Ktrain_samples}_geom{lambda_geom}_control{lambda_control}_recon{lambda_recon}_ta"
     os.makedirs("../Data/" + suffix, exist_ok=True)
     os.makedirs(logdir, exist_ok=True)
     writer = SummaryWriter(log_dir=logdir)
@@ -408,7 +400,7 @@ def main():
     parser.add_argument("--layer_depth", type=int, default=3)
     parser.add_argument("--lambda_geom", type=float, default=0.1, help="流形几何约束权重")
     parser.add_argument("--lambda_control", type=float, default=0.1, help="控制约束权重")
-    parser.add_argument("--lambda_recon", type=float, default=0.0, help="重建约束权重")
+    parser.add_argument("--lambda_recon", type=float, default=0.1, help="重建约束权重")
     args = parser.parse_args()
     
     train(args.env, 

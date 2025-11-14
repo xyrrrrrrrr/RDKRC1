@@ -139,18 +139,18 @@ def Eig_loss(net):
     loss = c[mask].sum()
     return loss
 
-def train(env_name,train_steps = 300000,suffix="",all_loss=0,\
+def train(env_name,train_steps = 500000,suffix="",all_loss=0,\
             encode_dim = 20,layer_depth=3,e_loss=1,gamma=0.5):
     np.random.seed(98)
     # Ktrain_samples = 100
     # Ktest_samples = 100
     Ktrain_samples = 50000
     Ktest_samples = 20000
-    Ktrainsteps = 15
-    Kteststeps = 30
+    Ktrainsteps = 10
+    Kteststeps = 10
     u_dim = 7
     b_dim = 7
-    Kbatch_size = 100
+    Kbatch_size = 512
     #data prepare
     data_collect = data_collecter(env_name)
     u_dim = data_collect.udim
@@ -175,6 +175,12 @@ def train(env_name,train_steps = 300000,suffix="",all_loss=0,\
     if torch.cuda.is_available():
         net.cuda() 
     net.double()
+    # for file in os.listdir("./Data/"):
+    #     if file.startswith("KK_KoopmanNonlinearA") and file.endswith(".pth"):
+    #         model_path = file  
+    # dicts = torch.load("./Data"+"/"+model_path)
+    # state_dict = dicts["model"]
+    # net.load_state_dict(state_dict)
     mse_loss = nn.MSELoss()
     optimizer = torch.optim.Adam(net.parameters(),
                                     lr=learning_rate)

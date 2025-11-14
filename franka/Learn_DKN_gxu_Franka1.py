@@ -206,7 +206,7 @@ def K_loss(data, net, u_dim=1, Nstate=4):
 
 # 带流形约束的损失函数
 def Klinear_loss_with_manifold(data, net, mse_loss, emb_loss, u_dim=1, gamma=0.99, 
-                               Nstate=4, all_loss=0, detach=0, lambda_geom=0.1, lambda_control=0.1, lambda_recon=0.1):
+                               Nstate=4, all_loss=0, detach=0, lambda_geom=0.1, lambda_control=0.1, lambda_recon=0.0):
     steps, train_traj_num, NKoopman = data.shape
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     data = torch.DoubleTensor(data).to(device)
@@ -319,10 +319,10 @@ def train(env_name,train_steps = 300000,suffix="",all_loss=0,\
             encode_dim = 20,layer_depth=3,e_loss=1,gamma=0.5):
     np.random.seed(98)
     Ktrain_samples = 50000
-    Ktest_samples = 2000
-    Ktrainsteps = 15
-    Kteststeps = 30
-    Kbatch_size = 100
+    Ktest_samples = 20000
+    Ktrainsteps = 10
+    Kteststeps = 10
+    Kbatch_size = 512
     u_dim = 7
     #data prepare
     data_collect = data_collecter(env_name)
@@ -350,6 +350,12 @@ def train(env_name,train_steps = 300000,suffix="",all_loss=0,\
     if torch.cuda.is_available():
         net.cuda() 
     net.double()
+    # for file in os.listdir("./Data"):
+    #     if file.startswith("KK_DKNGU1") and file.endswith(".pth"):
+    #         model_path = file  
+    # dicts = torch.load("./Data"+"/"+model_path)
+    # state_dict = dicts["model"]
+    # net.load_state_dict(state_dict)
     eval_step = 1000
     learning_rate = 1e-3
     mse_loss = nn.MSELoss()
@@ -362,7 +368,7 @@ def train(env_name,train_steps = 300000,suffix="",all_loss=0,\
     eval_step = 1000
     best_loss = 1000.0
     best_state_dict = {}
-    subsuffix = suffix+"KK_DKNGU"+env_name+"layer{}_edim{}_eloss{}_gamma{}_aloss{}".format(layer_depth,encode_dim,e_loss,gamma,all_loss)
+    subsuffix = suffix+"KK_DKNGU1"+env_name+"layer{}_edim{}_eloss{}_gamma{}_aloss{}".format(layer_depth,encode_dim,e_loss,gamma,all_loss)
     logdir = "Data/"+suffix+"/"+subsuffix
     if not os.path.exists( "Data/"+suffix):
         os.makedirs( "Data/"+suffix)
